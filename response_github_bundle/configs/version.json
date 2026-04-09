@@ -1,0 +1,15 @@
+{
+  "version": "1.1.0",
+  "release_date": "2026-04-01",
+  "scope": "postprocess-all-formats-summarization",
+  "notes": [
+    "DOC and PDF parsers now apply the same HwpPostprocessRules pipeline as HWP",
+    "DocParser._build_parsed_document now calls build_blocks(source_format='doc') and render_blocks_as_markdown instead of a simple paragraph split",
+    "PdfParser.parse now calls build_blocks(source_format='pdf') on extraction.markdown to populate blocks and chunks fields",
+    "build_blocks, chunk_blocks, and _make_chunk now accept a source_format parameter to generate doc-chunk-N and pdf-chunk-N style chunk IDs",
+    "LangChainRetrievalQAService now has a summarize_document() method that calls ChatOpenAI to generate a structured JSON summary",
+    "POST /api/summarize endpoint added: accepts document_id or source_name and returns summary_text, key_points, and document_type",
+    "GET /api/documents endpoint added: returns the list of structured documents available for summarization",
+    "The launcher UI now includes a Document Summary panel with a dropdown for document selection and a button to generate summaries"
+  ]
+}

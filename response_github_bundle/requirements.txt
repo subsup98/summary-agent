@@ -1,0 +1,11 @@
+chromadb==1.5.5
+langchain-community==0.4.1
+langchain-core==1.2.23
+langchain-experimental==0.4.1
+langchain-openai==1.1.12
+openai==2.30.0
+olefile==0.47
+PyMuPDF==1.27.2.2
+pydantic==2.12.5
+pymupdf4llm==1.27.2.2
+python-docx==1.2.0

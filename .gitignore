@@ -1,0 +1,23 @@
+# Environment variables (API keys - DO NOT COMMIT)
+.env
+.env.local
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Output files
+outputs/
+data/
+
+# Dependencies cache
+.deps_*/
+
+# IDE
+.vscode/
