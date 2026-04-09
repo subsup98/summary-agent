@@ -582,9 +582,8 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       --muted: #667085;
       --navy: #113b68;
       --navy-soft: rgba(17, 59, 104, 0.08);
-      --shadow: 0 14px 42px rgba(15, 23, 42, 0.06);
-      --radius-xl: 24px;
-      --ui-scale: 0.82;
+      --shadow: 0 12px 32px rgba(15, 23, 42, 0.05);
+      --radius-xl: 22px;
     }}
 
     * {{ box-sizing: border-box; }}
@@ -599,69 +598,67 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       font-family: "Segoe UI", "Malgun Gothic", sans-serif;
       color: var(--text);
       background: var(--bg);
-      padding: 18px;
+      padding: 10px;
     }}
 
     .app {{
-      width: calc(100% / var(--ui-scale));
-      max-width: 1900px;
-      height: calc((100vh - 36px) / var(--ui-scale));
-      min-height: calc((100vh - 36px) / var(--ui-scale));
-      margin: 0 auto;
+      width: 100%;
+      max-width: none;
+      height: calc(100vh - 20px);
+      min-height: calc(100vh - 20px);
+      margin: 0;
       display: grid;
-      grid-template-columns: 288px minmax(0, 1fr);
+      grid-template-columns: 278px minmax(0, 1fr);
       overflow: hidden;
-      zoom: var(--ui-scale);
       background: #fff;
       border: 1px solid rgba(15, 23, 42, 0.08);
-      border-radius: 30px;
-      box-shadow: 0 20px 60px rgba(15, 23, 42, 0.06);
+      border-radius: 22px;
+      box-shadow: 0 16px 44px rgba(15, 23, 42, 0.06);
     }}
 
     .sidebar {{
       height: 100%;
-      padding: 18px 16px;
+      padding: 14px 12px;
       border-right: 1px solid rgba(15, 23, 42, 0.06);
       background: #fff;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr);
-      gap: 16px;
+      gap: 12px;
       overflow: hidden;
     }}
 
     .brand {{
       display: flex;
       align-items: center;
-      gap: 12px;
-      font-size: 20px;
+      gap: 10px;
+      font-size: 18px;
       font-weight: 800;
       color: var(--navy);
       letter-spacing: -0.03em;
     }}
 
     .brand-badge {{
-      width: 34px;
-      height: 34px;
+      width: 30px;
+      height: 30px;
       border-radius: 999px;
       background: linear-gradient(135deg, var(--navy), #2d5d8f);
       color: #fff;
       display: grid;
       place-items: center;
-      font-size: 16px;
-      box-shadow: 0 10px 30px rgba(17, 59, 104, 0.24);
+      font-size: 14px;
+      box-shadow: 0 8px 18px rgba(17, 59, 104, 0.18);
     }}
 
     .sidebar-workspace {{
       min-height: 0;
       display: grid;
-      grid-template-rows: auto minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1.2fr) minmax(260px, 0.95fr);
       gap: 12px;
       overflow: hidden;
     }}
 
     .sidebar-workspace > .sidebar-section:first-child {{
-      overflow-y: auto;
-      max-height: 270px;
+      overflow: hidden;
     }}
 
     .sidebar-section {{
@@ -684,19 +681,22 @@ def render_document_studio_html(status: dict[str, object]) -> str:
     .sidebar-section-docs {{
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 10px;
       overflow: hidden;
-      min-height: 260px;
+      min-height: 0;
     }}
     .sidebar-section-docs .doc-list {{
       flex: 1 1 0;
       min-height: 0;
       overflow-y: scroll;
+      max-height: 232px;
     }}
 
     .sidebar-upload {{
       display: grid;
-      gap: 12px;
+      grid-template-rows: minmax(96px, 0.72fr) auto auto minmax(124px, 1fr);
+      gap: 8px;
+      height: 100%;
     }}
 
     .sidebar-upload-actions {{
@@ -718,15 +718,24 @@ def render_document_studio_html(status: dict[str, object]) -> str:
 
     .sidebar-selected-files {{
       display: grid;
-      gap: 8px;
-      max-height: 112px;
+      gap: 6px;
+      max-height: 56px;
       overflow: auto;
     }}
 
     #status-box {{
-      max-height: 72px;
+      min-height: 0;
+      height: 100%;
       overflow-y: auto;
-      scrollbar-width: thin;
+      scrollbar-width: auto;
+      padding: 10px 12px !important;
+      border-radius: 14px;
+      background: rgba(248,250,252,0.96);
+      border: 1px solid var(--line);
+      line-height: 1.55 !important;
+      font-size: 13px !important;
+      word-break: keep-all;
+      overflow-wrap: anywhere;
     }}
 
     .sidebar-list-head {{
@@ -758,6 +767,7 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       border: 1px solid var(--line);
       font-size: 13px;
       min-height: 46px;
+      flex: 0 0 auto;
     }}
 
     .selection-status-names {{
@@ -784,19 +794,19 @@ def render_document_studio_html(status: dict[str, object]) -> str:
     .main {{
       height: 100%;
       min-height: 100%;
-      padding: 16px;
+      padding: 12px;
       overflow: hidden;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr);
-      gap: 14px;
+      gap: 10px;
     }}
 
     .topbar {{
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 12px;
-      min-height: 40px;
+      gap: 8px;
+      min-height: 28px;
     }}
 
     .page-title {{
@@ -804,17 +814,10 @@ def render_document_studio_html(status: dict[str, object]) -> str:
     }}
 
     .page-title h1 {{
-      margin: 0 0 4px;
-      font-size: 24px;
+      margin: 0;
+      font-size: 20px;
       letter-spacing: -0.05em;
       line-height: 1.1;
-    }}
-
-    .page-title p {{
-      margin: 0;
-      color: var(--muted);
-      font-size: 14px;
-      line-height: 1.6;
     }}
 
     .topbar-right {{
@@ -857,15 +860,15 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       gap: 8px;
       align-content: start;
       overflow-y: scroll;
-      padding-right: 2px;
-      min-height: 180px;
+      padding-right: 4px;
+      min-height: 140px;
       scrollbar-gutter: stable;
     }}
 
     .sidebar-doc-list {{
       max-height: none;
       padding-bottom: 4px;
-      min-height: 180px;
+      min-height: 140px;
     }}
 
     .doc-card {{
@@ -913,7 +916,7 @@ def render_document_studio_html(status: dict[str, object]) -> str:
 
     .doc-card strong {{
       display: -webkit-box;
-      -webkit-line-clamp: 2;
+      -webkit-line-clamp: 3;
       -webkit-box-orient: vertical;
       overflow: hidden;
       line-height: 1.4;
@@ -924,7 +927,35 @@ def render_document_studio_html(status: dict[str, object]) -> str:
     }}
 
     .doc-card p {{
-      display: none;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+    }}
+
+    .sidebar-selected-files,
+    #status-box,
+    .doc-list {{
+      scrollbar-color: rgba(17, 59, 104, 0.35) transparent;
+    }}
+
+    .sidebar-selected-files::-webkit-scrollbar,
+    #status-box::-webkit-scrollbar,
+    .doc-list::-webkit-scrollbar {{
+      width: 10px;
+    }}
+
+    .sidebar-selected-files::-webkit-scrollbar-thumb,
+    #status-box::-webkit-scrollbar-thumb,
+    .doc-list::-webkit-scrollbar-thumb {{
+      background: rgba(17, 59, 104, 0.28);
+      border-radius: 999px;
+      border: 2px solid transparent;
+      background-clip: padding-box;
     }}
 
     .doc-check {{
@@ -962,8 +993,8 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       height: 100%;
       padding: 0;
       display: grid;
-      gap: 12px;
-      grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.45fr);
+      gap: 10px;
+      grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.35fr);
       min-height: 0;
       overflow: hidden;
     }}
@@ -975,7 +1006,7 @@ def render_document_studio_html(status: dict[str, object]) -> str:
 
     .summary-box,
     .qa-box {{
-      padding: 16px;
+      padding: 14px;
       min-height: 0;
       overflow: hidden;
     }}
@@ -1001,8 +1032,8 @@ def render_document_studio_html(status: dict[str, object]) -> str:
     .source-guide-label {{
       display: flex;
       align-items: center;
-      gap: 7px;
-      font-size: 13px;
+      gap: 6px;
+      font-size: 12px;
       font-weight: 700;
       color: var(--navy);
       letter-spacing: 0.03em;
@@ -1026,17 +1057,22 @@ def render_document_studio_html(status: dict[str, object]) -> str:
 
     .summary-toggle:hover {{ color: var(--navy); }}
 
+    .source-guide-label::before {{
+      content: "•";
+      font-size: 10px;
+    }}
+
     #summary-content.guide-collapsed {{
       display: none;
     }}
 
     .summary-meta {{
       display: flex;
-      gap: 10px;
+      gap: 8px;
       flex-wrap: wrap;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
       color: var(--muted);
-      font-size: 13px;
+      font-size: 12px;
       overflow: hidden;
     }}
 
@@ -1049,10 +1085,10 @@ def render_document_studio_html(status: dict[str, object]) -> str:
 
     .summary-text {{
       margin: 0;
-      font-size: 17px;
-      line-height: 1.95;
-      padding: 16px 18px;
-      border-radius: 18px;
+      font-size: 15px;
+      line-height: 1.75;
+      padding: 14px 16px;
+      border-radius: 16px;
       background: #fff;
       border: 1px solid rgba(15, 23, 42, 0.08);
     }}
@@ -1065,25 +1101,26 @@ def render_document_studio_html(status: dict[str, object]) -> str:
 
     .points {{
       display: grid;
-      gap: 10px;
-      margin-top: 18px;
+      gap: 8px;
+      margin-top: 12px;
     }}
 
     .point {{
-      padding: 12px 14px;
-      border-radius: 16px;
+      padding: 10px 12px;
+      border-radius: 14px;
       background: #fbfcfe;
       border: 1px solid rgba(17,59,104,0.08);
       box-shadow: inset 3px 0 0 rgba(17, 59, 104, 0.12);
-      line-height: 1.75;
+      line-height: 1.6;
+      font-size: 13px;
     }}
 
     .toolbar {{
       display: flex;
-      gap: 12px;
+      gap: 8px;
       flex-wrap: wrap;
       align-items: center;
-      margin-top: 16px;
+      margin-top: 0;
     }}
 
     .circle-button {{
@@ -1115,7 +1152,7 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       border-radius: 999px;
       background: var(--navy);
       color: #fff;
-      padding: 12px 18px;
+      padding: 9px 13px;
       font: inherit;
       font-weight: 700;
       cursor: pointer;
@@ -1144,7 +1181,7 @@ def render_document_studio_html(status: dict[str, object]) -> str:
     .upload-dropzone {{
       border: 2px dashed rgba(17, 59, 104, 0.22);
       border-radius: 14px;
-      padding: 18px 12px;
+      padding: 14px 12px;
       text-align: center;
       color: var(--muted);
       font-size: 13px;
@@ -1205,6 +1242,7 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       padding: 10px 12px;
       cursor: pointer;
       user-select: none;
+      flex: 0 0 auto;
     }}
 
     .select-all-text {{
@@ -1218,15 +1256,15 @@ def render_document_studio_html(status: dict[str, object]) -> str:
 
     .question-area {{
       width: 100%;
-      min-height: 44px;
-      max-height: 44px;
+      min-height: 42px;
+      max-height: 42px;
       resize: none;
-      border-radius: 18px;
+      border-radius: 16px;
       border: 1px solid rgba(15, 23, 42, 0.10);
       background: #fff;
-      padding: 10px 16px;
+      padding: 9px 14px;
       font: inherit;
-      line-height: 1.55;
+      line-height: 1.45;
     }}
 
     .evidence-list {{
@@ -1246,15 +1284,15 @@ def render_document_studio_html(status: dict[str, object]) -> str:
     .qa-box {{
       display: grid;
       grid-template-rows: auto minmax(0, 1fr) auto;
-      gap: 14px;
+      gap: 10px;
     }}
 
     .chat-shell {{
       min-height: 0;
-      border-radius: 26px;
-      background: linear-gradient(180deg, rgba(250, 251, 253, 0.96), rgba(255,255,255,0.98));
+      border-radius: 20px;
+      background: #fff;
       border: 1px solid rgba(15, 23, 42, 0.08);
-      padding: 18px;
+      padding: 14px;
       overflow-y: auto;
     }}
 
@@ -1272,12 +1310,12 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       display: grid;
       place-items: center;
       text-align: center;
-      padding: 32px 24px;
-      border-radius: 24px;
+      padding: 24px 18px;
+      border-radius: 18px;
       border: 1px dashed rgba(17, 59, 104, 0.18);
-      background: rgba(255,255,255,0.72);
+      background: #fff;
       color: var(--muted);
-      line-height: 1.8;
+      line-height: 1.65;
     }}
 
     .chat-turn {{
@@ -1344,8 +1382,8 @@ def render_document_studio_html(status: dict[str, object]) -> str:
     .chat-answer-text {{
       margin: 0;
       color: var(--text);
-      line-height: 1.9;
-      font-size: 16px;
+      line-height: 1.75;
+      font-size: 15px;
       white-space: pre-wrap;
     }}
 
@@ -1360,13 +1398,13 @@ def render_document_studio_html(status: dict[str, object]) -> str:
     .chat-composer {{
         display: grid;
         grid-template-columns: minmax(0, 1fr) auto;
-        gap: 12px;
+        gap: 10px;
         align-items: end;
-        padding: 14px;
-        border-radius: 24px;
-        background: rgba(255,255,255,0.98);
+        padding: 10px;
+        border-radius: 18px;
+        background: #fff;
         border: 1px solid rgba(15, 23, 42, 0.08);
-        box-shadow: 0 -2px 24px rgba(15, 23, 42, 0.04);
+        box-shadow: 0 4px 18px rgba(15, 23, 42, 0.03);
         min-height: 0;
     }}
     
@@ -1411,7 +1449,6 @@ def render_document_studio_html(status: dict[str, object]) -> str:
         min-height: 100vh;
         width: 100%;
         max-width: none;
-        zoom: 1;
         margin: 0;
         overflow: visible;
         border-radius: 0;
@@ -1441,6 +1478,7 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       }}
       .sidebar-section-docs .doc-list {{
         flex: none;
+        max-height: none;
       }}
 
       /* 모바일: 내부 스크롤 제거 → 목록 전체 표시, 페이지 스크롤로 탐색 */
@@ -1629,7 +1667,6 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       <div class="topbar">
         <div class="page-title">
           <h1>문서 보기</h1>
-          <p>{qa_caption}</p>
         </div>
       </div>
 
@@ -1640,7 +1677,7 @@ def render_document_studio_html(status: dict[str, object]) -> str:
           <section class="panel summary-box">
             <div class="summary-header">
               <div>
-                <h2>요약 <span class="source-guide-label">소스 가이드</span></h2>
+                <h2>요약</h2>
               </div>
               <div class="toolbar">
                 <button class="ghost-button" id="download-md-button" type="button">다운로드 .md</button>
@@ -1787,14 +1824,14 @@ def render_document_studio_html(status: dict[str, object]) -> str:
       const selectedDocs = scoped
         .map((id) => state.documents.find((d) => d.document_id === id))
         .filter(Boolean);
-      const MAX_SHOW = 4;
+      const MAX_SHOW = 2;
       const shownDocs = selectedDocs.slice(0, MAX_SHOW);
       const restCount = selectedDocs.length - shownDocs.length;
       const nameItemsHtml = shownDocs
         .map((d) => `<span class="selection-status-name-item" title="${{esc(d.source_name || d.document_id)}}">${{esc(d.source_name || d.document_id)}}</span>`)
         .join('');
       const restHtml = restCount > 0
-        ? `<span class="selection-status-name-item" style="font-style:italic;">외 ${{restCount}}개</span>`
+        ? `<span class="selection-status-name-item" style="font-style:italic;">? ${{restCount}}?</span>`
         : '';
       checkedSummary.innerHTML = `
         <div class="selection-status-names">
