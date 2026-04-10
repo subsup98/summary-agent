@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Document Studio</title>
+  <link rel="stylesheet" href="/static/document-studio.css?v=20260410d">
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+</head>
+<body>
+  <script>
+    window.__DOCUMENT_STUDIO__ = {
+      initialStatus: {{INITIAL_STATUS_JSON}},
+      supportedAccept: "{{SUPPORTED_ACCEPT}}",
+      defaultQaStrategy: "{{DEFAULT_QA_STRATEGY}}"
+    };
+  </script>
+
+  <div class="app-shell">
+    <aside class="source-pane" id="source-pane">
+      <div class="panel source-panel">
+        <div class="source-header">
+          <div>
+            <h2>출처</h2>
+          </div>
+          <button class="icon-button source-close-button" id="close-source-viewer-button" type="button" title="문서 닫기" hidden>
+            <span class="icon-collapse" aria-hidden="true"></span>
+          </button>
+        </div>
+
+        <div class="source-body" id="source-list-view">
+          <button class="source-add-button" id="open-upload-modal-button" type="button">
+            <span class="source-add-plus">+</span>
+            <span>소스 추가</span>
+          </button>
+
+          <div class="upload-notice" id="upload-notice" hidden></div>
+
+          <div class="select-all-row" id="select-all-row" hidden>
+            <span class="select-all-text">전체 선택</span>
+            <span class="doc-check" id="select-all-check" aria-hidden="true"></span>
+            <button id="delete-selected-button" class="trash-button" type="button" aria-label="선택 문서 삭제" title="선택 문서 삭제">
+              <span class="trash-emoji" aria-hidden="true">🗑</span>
+            </button>
+          </div>
+
+          <div class="doc-list" id="document-list">
+            <div class="placeholder-card">문서 목록을 불러오는 중입니다.</div>
+          </div>
+        </div>
+
+        <div class="source-body source-detail-view" id="source-detail-view" hidden>
+          <div class="source-detail-title-row">
+            <h3 id="source-detail-title">문서</h3>
+          </div>
+
+          <section class="source-summary-card" id="source-summary-card">
+            <button class="source-summary-toggle" id="source-summary-toggle" type="button" aria-expanded="true">
+              <span class="source-summary-toggle-copy">
+                <span class="source-summary-label">문서 요약</span>
+                <strong id="source-detail-name">문서 이름</strong>
+              </span>
+              <span class="source-summary-chevron" aria-hidden="true"></span>
+            </button>
+            <div class="source-summary-body" id="source-summary-body">
+              <p class="source-summary-text" id="source-detail-summary">선택한 문서의 요약이 여기에 표시됩니다.</p>
+            </div>
+          </section>
+
+          <section class="source-original-card">
+            <div class="source-original-head">
+              <strong>원본 문서</strong>
+              <span class="source-original-meta" id="source-detail-meta"></span>
+            </div>
+            <div class="source-original-preview" id="source-detail-original"></div>
+          </section>
+
+          <section class="source-original-card">
+            <div class="source-original-head">
+              <strong>파싱 결과</strong>
+            </div>
+            <div class="source-original-content" id="source-detail-content"></div>
+          </section>
+        </div>
+      </div>
+    </aside>
+
+    <main class="chat-pane">
+      <div class="panel chat-panel">
+        <div class="chat-header">
+          <div>
+            <h2>채팅</h2>
+          </div>
+          <div class="chat-header-actions">
+            <button class="icon-button" id="download-md-button" type="button" title="Markdown 다운로드">
+              <span class="icon-download" aria-hidden="true"></span>
+            </button>
+            <button class="icon-button" id="download-txt-button" type="button" title="텍스트 다운로드">
+              <span class="icon-doc" aria-hidden="true"></span>
+            </button>
+            <button class="icon-button" id="summary-toggle" type="button" title="요약 접기 또는 펼치기">
+              <span class="icon-layout" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
+
+        <div class="summary-banner" id="summary-content">
+          <div class="summary-banner-kicker">선택한 문서 안내</div>
+          <p class="summary-banner-text muted">문서를 선택하면 요약이 여기에 표시되고, 아래 채팅은 해당 문서를 기준으로 질문합니다.</p>
+        </div>
+
+        <div class="chat-shell">
+          <div class="chat-history" id="chat-history">
+            <div class="chat-empty">문서를 선택하고 질문을 입력해보세요.</div>
+          </div>
+        </div>
+
+        <form class="chat-composer" id="query-form">
+          <textarea class="question-area" id="query-input" placeholder="입력을 시작하세요..."></textarea>
+          <div class="chat-toolbar">
+            <span class="chat-toolbar-meta" id="qa-caption"></span>
+            <button class="send-button" id="query-button" type="submit" aria-label="질문 전송">
+              <span class="send-arrow" aria-hidden="true"></span>
+            </button>
+          </div>
+        </form>
+      </div>
+    </main>
+  </div>
+
+  <div class="modal-shell" id="upload-modal" hidden>
+    <div class="modal-backdrop" data-close-modal="true"></div>
+    <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="upload-modal-title">
+      <div class="modal-header">
+        <div>
+          <h2 id="upload-modal-title">문서를 업로드하세요</h2>
+          <p class="modal-copy">파일을 선택하거나 드래그하면 바로 업로드가 시작됩니다.</p>
+        </div>
+        <button class="icon-button" id="close-upload-modal-button" type="button" aria-label="닫기">
+          <span class="icon-close" aria-hidden="true"></span>
+        </button>
+      </div>
+
+      <form class="modal-body" id="workspace-upload-form">
+        <input id="workspace-documents" name="documents" type="file" multiple accept="{{SUPPORTED_ACCEPT}}">
+
+        <div id="upload-dropzone" class="upload-dropzone" tabindex="0">
+          <span class="upload-dropzone-icon">+</span>
+          <strong>파일을 드래그하거나 클릭해서 선택</strong>
+          <span>PDF, DOC, DOCX, HWP, HWPX, TXT 파일을 업로드할 수 있습니다.</span>
+        </div>
+
+        <div class="sidebar-selected-files modal-selected-files" id="workspace-selected-files">
+          <span class="file-chip muted">선택된 문서가 없습니다.</span>
+        </div>
+
+        <div class="modal-actions">
+          <button class="secondary-button" id="workspace-pick-button" type="button">파일 선택</button>
+          <div class="upload-spinner" id="upload-spinner" aria-hidden="true"></div>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <script src="/static/document-studio.js?v=20260410d" defer></script>
+</body>
+</html>

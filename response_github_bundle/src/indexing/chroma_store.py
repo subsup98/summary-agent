@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -35,6 +36,7 @@ class ChromaIndexManager:
         backend_token = normalize_model_token(self.embedding_model)
         self.rule_collection = self.client.get_or_create_collection(name=f"parsed_documents_rule_{backend_token}")
         self.semantic_collection = self.client.get_or_create_collection(name=f"parsed_documents_semantic_{backend_token}")
+        self._lock = threading.Lock()
 
     def close(self) -> None:
         try:
@@ -49,6 +51,30 @@ class ChromaIndexManager:
             if record.get("source_hash") == source_hash:
                 return record
         return None
+
+    def ingest_single_document(
+        self,
+        payload: dict[str, Any],
+        source_root: Path | None = None,
+    ) -> dict[str, Any]:
+        """파싱 직후 단일 문서를 즉시 벡터 인덱싱한다. 스레드 안전."""
+        with self._lock:
+            registry = self._load_registry()
+            try:
+                result = self._ingest_payload(payload, registry, source_root=source_root)
+            except Exception as error:
+                return {
+                    "status": "failed",
+                    "record": {
+                        "document_id": payload.get("document_id"),
+                        "source_name": payload.get("source_name"),
+                        "status": "failed",
+                        "error": str(error),
+                    },
+                    "comparison": None,
+                }
+            write_json(self.registry_path, registry)
+        return result
 
     def ingest_structured_documents(
         self,

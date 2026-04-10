@@ -1,0 +1,178 @@
+<mxfile host="app.diagrams.net" modified="2026-04-10T00:00:00.000Z" agent="Codex" version="24.7.17">
+  <diagram id="doc-studio-verified" name="Verified Workflow">
+    <mxGraphModel dx="1600" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2400" pageHeight="3200" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="2" value="&lt;b&gt;Document Studio Workflow (Verified Against Code)&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=28;fontStyle=1;fontColor=#0f172a;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1300" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="response.py, src/ui/review_server.py, src/pipeline/parsing_pipeline.py, src/indexing/chroma_store.py, src/retreival_lanchain/retrieval_qa.py, src/retrieval/chroma_retriever.py 기준" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=15;fontColor=#475569;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="40" y="58" width="1700" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="4" value="&lt;b&gt;검증 보정사항&lt;/b&gt;&lt;br/&gt;1. 문서 목록은 structured JSON 스캔 기반&lt;br/&gt;2. 업로드 후 project structured docs를 먼저 vector DB와 sync&lt;br/&gt;3. summary는 cache-first&lt;br/&gt;4. 메인 QA 경로는 /api/query&lt;br/&gt;5. vector indexing은 rule-based + semantic 둘 다 유지" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#cbd5e1;fontSize=14;fontColor=#334155;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1510" y="16" width="790" height="106" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="70" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fafc;strokeColor=#cbd5e1;dashed=1;dashPattern=8 8;strokeWidth=2;arcSize=18;" vertex="1" parent="1">
+          <mxGeometry x="90" y="980" width="2210" height="420" as="geometry"/>
+        </mxCell>
+        <mxCell id="71" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fafc;strokeColor=#cbd5e1;dashed=1;dashPattern=8 8;strokeWidth=2;arcSize=18;" vertex="1" parent="1">
+          <mxGeometry x="90" y="1460" width="2210" height="240" as="geometry"/>
+        </mxCell>
+        <mxCell id="72" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fafc;strokeColor=#cbd5e1;dashed=1;dashPattern=8 8;strokeWidth=2;arcSize=18;" vertex="1" parent="1">
+          <mxGeometry x="90" y="1830" width="2210" height="670" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="10" value="&lt;b&gt;프로그램 실행&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e0f2fe;strokeColor=#0284c7;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#0f172a;arcSize=16;" vertex="1" parent="1">
+          <mxGeometry x="1030" y="140" width="340" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="11" value="&lt;b&gt;서버 시작&lt;/b&gt;&lt;br/&gt;response.py main() + LangChain warmup" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;strokeWidth=2;fontSize=16;fontColor=#0f172a;arcSize=16;" vertex="1" parent="1">
+          <mxGeometry x="930" y="230" width="540" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="12" value="&lt;b&gt;브라우저 UI 접속&lt;/b&gt;&lt;br/&gt;/ Document Studio" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e0f2fe;strokeColor=#0284c7;strokeWidth=2;fontSize=16;fontColor=#0f172a;arcSize=16;" vertex="1" parent="1">
+          <mxGeometry x="930" y="340" width="540" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="13" value="&lt;b&gt;문서 목록 요청&lt;/b&gt;&lt;br/&gt;GET /api/documents" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ede9fe;strokeColor=#7c3aed;strokeWidth=2;fontSize=16;fontColor=#0f172a;arcSize=16;" vertex="1" parent="1">
+          <mxGeometry x="930" y="450" width="540" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="14" value="&lt;b&gt;구조화 문서 조회&lt;/b&gt;&lt;br/&gt;project + outputs/ui_runs/*/structured/documents" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;strokeWidth=2;fontSize=16;fontColor=#0f172a;arcSize=16;" vertex="1" parent="1">
+          <mxGeometry x="930" y="560" width="540" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="15" value="&lt;b&gt;문서 목록 표시&lt;/b&gt;&lt;br/&gt;basic / llm / ui summary cache 포함" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e0f2fe;strokeColor=#0284c7;strokeWidth=2;fontSize=16;fontColor=#0f172a;arcSize=16;" vertex="1" parent="1">
+          <mxGeometry x="930" y="670" width="540" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="16" value="&lt;b&gt;사용자 문서 업로드&lt;/b&gt;&lt;br/&gt;drag-and-drop 또는 파일 선택" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e0f2fe;strokeColor=#0284c7;strokeWidth=2;fontSize=16;fontColor=#0f172a;arcSize=16;" vertex="1" parent="1">
+          <mxGeometry x="930" y="780" width="540" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="17" value="&lt;b&gt;업로드 API 호출&lt;/b&gt;&lt;br/&gt;POST /api/run" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ede9fe;strokeColor=#7c3aed;strokeWidth=2;fontSize=16;fontColor=#0f172a;arcSize=16;" vertex="1" parent="1">
+          <mxGeometry x="930" y="890" width="540" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="18" value="&lt;b&gt;업로드 저장 + run_id 생성 + 백그라운드 작업 시작&lt;/b&gt;&lt;br/&gt;ReviewSessionManager.start_run() → worker thread" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;strokeWidth=2;fontSize=16;fontColor=#0f172a;arcSize=16;" vertex="1" parent="1">
+          <mxGeometry x="850" y="1010" width="700" height="86" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="19" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="10" target="11"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="20" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="11" target="12"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="21" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="12" target="13"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="22" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="13" target="14"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="23" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="14" target="15"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="24" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="15" target="16"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="25" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="16" target="17"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="26" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="17" target="18"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <mxCell id="27" value="&lt;b&gt;1. Parsing Pipeline&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=20;fontStyle=1;fontColor=#0f172a;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="120" y="992" width="400" height="28" as="geometry"/>
+        </mxCell>
+        <mxCell id="28" value="&lt;b&gt;기존 project 결과 sync&lt;/b&gt;&lt;br/&gt;data/structured/documents → vector DB" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="160" y="1060" width="340" height="84" as="geometry"/>
+        </mxCell>
+        <mxCell id="29" value="&lt;b&gt;업로드 중복 검사&lt;/b&gt;&lt;br/&gt;source hash 기준 사전 중복 판정" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="560" y="1060" width="340" height="84" as="geometry"/>
+        </mxCell>
+        <mxCell id="30" value="&lt;b&gt;문서 탐색&lt;/b&gt;&lt;br/&gt;DocumentLoader.discover_documents()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="960" y="1060" width="340" height="84" as="geometry"/>
+        </mxCell>
+        <mxCell id="31" value="&lt;b&gt;문서 분류 + 파싱&lt;/b&gt;&lt;br/&gt;PDF / DOCX / DOC / HWP / TXT / fallback" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1360" y="1060" width="340" height="84" as="geometry"/>
+        </mxCell>
+        <mxCell id="32" value="&lt;b&gt;basic summary + semantic chunks 생성&lt;/b&gt;&lt;br/&gt;ensure_basic_summary() + build_semantic_chunks()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1760" y="1060" width="380" height="84" as="geometry"/>
+        </mxCell>
+        <mxCell id="33" value="&lt;b&gt;structured JSON / markdown 저장&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="700" y="1190" width="380" height="74" as="geometry"/>
+        </mxCell>
+        <mxCell id="34" value="&lt;b&gt;review reports 생성&lt;/b&gt;&lt;br/&gt;PDF overlay + parsing review" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="1190" width="380" height="74" as="geometry"/>
+        </mxCell>
+        <mxCell id="35" value="&lt;b&gt;run summary 기록&lt;/b&gt;&lt;br/&gt;latest_run.json / latest_run.md" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#475569;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1620" y="1190" width="380" height="74" as="geometry"/>
+        </mxCell>
+        <mxCell id="36" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="18" target="28"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="37" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="28" target="29"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="38" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="29" target="30"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="39" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="30" target="31"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="40" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="31" target="32"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="41" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="32" target="33"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="42" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="33" target="34"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="43" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="34" target="35"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <mxCell id="44" value="&lt;b&gt;2. Vector Indexing&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=20;fontStyle=1;fontColor=#0f172a;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="120" y="1472" width="300" height="28" as="geometry"/>
+        </mxCell>
+        <mxCell id="45" value="&lt;b&gt;중복 판정 + chunk 준비 + 임베딩 + Chroma 저장&lt;/b&gt;&lt;br/&gt;rule-based + semantic collections 유지" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="280" y="1540" width="640" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="46" value="&lt;b&gt;session.json / latest_session.json 저장&lt;/b&gt;&lt;br/&gt;timings, vector summary, QA ready 계산" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="980" y="1540" width="540" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="47" value="&lt;b&gt;documents_updated SSE + job polling 완료&lt;/b&gt;&lt;br/&gt;문서 목록 새로고침 + 신규 문서 자동 요약 시작" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e0f2fe;strokeColor=#0284c7;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1580" y="1540" width="560" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="48" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="35" target="45"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="49" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="45" target="46"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="50" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="46" target="47"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <mxCell id="51" value="&lt;b&gt;3. Summary / QA Branches&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=20;fontStyle=1;fontColor=#0f172a;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="120" y="1842" width="360" height="28" as="geometry"/>
+        </mxCell>
+        <mxCell id="52" value="&lt;b&gt;문서 요약 요청&lt;/b&gt;&lt;br/&gt;POST /api/summarize" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce7f3;strokeColor=#db2777;strokeWidth=2;fontSize=16;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="160" y="1930" width="360" height="82" as="geometry"/>
+        </mxCell>
+        <mxCell id="53" value="&lt;b&gt;캐시 있음?&lt;/b&gt;&lt;br/&gt;ui / llm / basic" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff7ed;strokeColor=#ea580c;strokeWidth=2;fontSize=15;fontColor=#0f172a;" vertex="1" parent="1">
+          <mxGeometry x="560" y="1930" width="250" height="86" as="geometry"/>
+        </mxCell>
+        <mxCell id="54" value="&lt;b&gt;즉시 반환&lt;/b&gt;&lt;br/&gt;cached summary payload" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce7f3;strokeColor=#db2777;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="260" y="2090" width="360" height="82" as="geometry"/>
+        </mxCell>
+        <mxCell id="55" value="&lt;b&gt;LangChain 요약 또는 basic fallback&lt;/b&gt;&lt;br/&gt;OpenAI 가능 시 summarize_document()&lt;br/&gt;결과는 ui_summary 로 캐시" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce7f3;strokeColor=#db2777;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="680" y="2090" width="520" height="96" as="geometry"/>
+        </mxCell>
+        <mxCell id="56" value="&lt;b&gt;질문 요청&lt;/b&gt;&lt;br/&gt;POST /api/query&lt;br/&gt;비교용 /api/query-compare 는 별도" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce7f3;strokeColor=#db2777;strokeWidth=2;fontSize=16;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="1930" width="360" height="96" as="geometry"/>
+        </mxCell>
+        <mxCell id="57" value="&lt;b&gt;LangChain 가능?&lt;/b&gt;&lt;br/&gt;OPENAI / service ready" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff7ed;strokeColor=#ea580c;strokeWidth=2;fontSize=15;fontColor=#0f172a;" vertex="1" parent="1">
+          <mxGeometry x="1660" y="1930" width="250" height="86" as="geometry"/>
+        </mxCell>
+        <mxCell id="58" value="&lt;b&gt;LangChain RAG&lt;/b&gt;&lt;br/&gt;semantic Chroma retrieval + reranker + ChatOpenAI answer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce7f3;strokeColor=#db2777;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="2090" width="480" height="96" as="geometry"/>
+        </mxCell>
+        <mxCell id="59" value="&lt;b&gt;Custom retriever fallback&lt;/b&gt;&lt;br/&gt;Chroma search + evidence ranking + local / OpenAI fallback" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce7f3;strokeColor=#db2777;strokeWidth=2;fontSize=15;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="1880" y="2090" width="340" height="96" as="geometry"/>
+        </mxCell>
+        <mxCell id="60" value="yes" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=14;fontColor=#475569;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="620" y="1898" width="60" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="61" value="no" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=14;fontColor=#475569;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="820" y="2048" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="62" value="yes" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=14;fontColor=#475569;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="1720" y="1898" width="60" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="63" value="no" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=14;fontColor=#475569;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="1920" y="2048" width="50" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="64" value="&lt;b&gt;UI 표시&lt;/b&gt;&lt;br/&gt;summary / answer / citations" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#475569;strokeWidth=2;fontSize=17;fontColor=#0f172a;arcSize=14;" vertex="1" parent="1">
+          <mxGeometry x="960" y="2280" width="460" height="82" as="geometry"/>
+        </mxCell>
+        <mxCell id="65" value="&lt;b&gt;End&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#475569;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#0f172a;arcSize=18;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="2410" width="240" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="66" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="47" target="52"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="67" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="47" target="56"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="68" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="52" target="53"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="69" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="53" target="54"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="73" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="53" target="55"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="74" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="56" target="57"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="75" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="57" target="58"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="76" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="57" target="59"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="77" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="54" target="64"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="78" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="55" target="64"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="79" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="58" target="64"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="80" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="59" target="64"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="81" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#334155;strokeWidth=2;" edge="1" parent="1" source="64" target="65"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

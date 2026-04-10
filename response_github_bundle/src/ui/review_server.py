@@ -4,6 +4,8 @@ import html
 import json
 import queue
 import re
+import shutil
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -12,6 +14,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import unquote
 from uuid import uuid4
+
+import fitz
 
 from src.indexing.chroma_store import ChromaIndexManager
 from src.indexing.embedding_backends import EmbeddingBackend
@@ -41,6 +45,7 @@ class ReviewSessionManager:
         self.project_process_compare_root = project_root / "outputs" / "process_compare_dashboard"
         self.project_latest_run_path = project_root / "outputs" / "parsing" / "logs" / "latest_run.json"
         self.runs_root = project_root / "outputs" / "ui_runs"
+        self.preview_root = project_root / "outputs" / "ui_previews"
         self.latest_session_path = self.runs_root / "latest_session.json"
         self.jobs: dict[str, dict[str, Any]] = {}
         self.job_lock = threading.Lock()
@@ -48,6 +53,7 @@ class ReviewSessionManager:
         self._sse_lock = threading.Lock()
         self.index_manager = ChromaIndexManager(project_root=project_root, embedding_backend=embedding_backend)
         ensure_directory(self.runs_root)
+        ensure_directory(self.preview_root)
         self._ensure_project_parsing_review()
 
     def close(self) -> None:
@@ -174,8 +180,26 @@ class ReviewSessionManager:
             if path.is_file() and path.name not in unique_names:
                 path.unlink()
 
+        # 파싱 완료된 문서를 즉시 벡터 인덱싱하기 위한 콜백과 결과 수집기
+        index_results: list[dict[str, Any]] = []
+        index_results_lock = threading.Lock()
+        done_count = [0]
+
+        def on_document_ready(payload: dict[str, Any]) -> None:
+            result = self.index_manager.ingest_single_document(payload, source_root=source_root)
+            with index_results_lock:
+                index_results.append(result)
+                done_count[0] += 1
+                current = done_count[0]
+            if progress_callback:
+                progress_callback(
+                    f"파싱·인덱싱 완료: {payload.get('source_name', '')} ({current}/{len(unique_uploads)})",
+                    current,
+                    len(unique_uploads),
+                )
+
         if progress_callback:
-            progress_callback("신규 문서를 파싱하고 후처리하는 중입니다.", 0, len(unique_uploads))
+            progress_callback("신규 문서를 병렬 파싱·인덱싱하는 중입니다.", 0, len(unique_uploads))
         stage_timings["parse_started_at"] = iso_now()
         parse_started_perf = time.perf_counter()
         config = ParsingPipelineConfig(
@@ -186,6 +210,7 @@ class ReviewSessionManager:
             comparisons_root=session_root / "comparisons",
             reports_root=session_root / "reports",
             enable_omitted_picture_ocr=False,
+            on_document_ready=on_document_ready,
         )
         summary = ParsingPipeline(config).run()
         stage_timings["parse_finished_at"] = iso_now()
@@ -200,23 +225,29 @@ class ReviewSessionManager:
         stage_timings["overlay_report_seconds"] = pipeline_timings.get("overlay_report_seconds")
         stage_timings["parsing_review_seconds"] = pipeline_timings.get("parsing_review_seconds")
         stage_timings["report_build_seconds"] = pipeline_timings.get("report_build_seconds")
-        if progress_callback:
-            progress_callback("문서 파싱과 후처리가 완료되었습니다.", len(unique_uploads), len(unique_uploads))
+        # 파싱·인덱싱이 동시에 진행되므로 vector_index 타이밍은 parse와 동일 구간
+        stage_timings["vector_index_started_at"] = stage_timings["parse_started_at"]
+        stage_timings["vector_index_finished_at"] = stage_timings["parse_finished_at"]
+        stage_timings["vector_index_seconds"] = stage_timings["parse_seconds"]
 
-        if progress_callback:
-            progress_callback("청크 비교와 벡터 인덱싱을 진행하는 중입니다.", 0, len(unique_uploads))
-        stage_timings["vector_index_started_at"] = iso_now()
-        index_started_perf = time.perf_counter()
-        vector_summary = self.index_manager.ingest_structured_documents(
-            structured_documents_root=session_root / "structured" / "documents",
-            source_root=source_root,
-            progress_callback=progress_callback,
-        )
-        stage_timings["vector_index_finished_at"] = iso_now()
-        stage_timings["vector_index_seconds"] = round(time.perf_counter() - index_started_perf, 3)
-        total_vector_documents = int(vector_summary.get("total_documents", 0) or 0)
-        ready_documents = int(vector_summary.get("indexed_documents", 0) or 0) + int(vector_summary.get("duplicate_documents", 0) or 0)
-        failed_vector_documents = int(vector_summary.get("failed_documents", 0) or 0)
+        # 콜백으로 수집된 개별 인덱싱 결과로 vector_summary 구성
+        indexed_results = [r for r in index_results if r.get("status") == "indexed"]
+        duplicate_results = [r for r in index_results if r.get("status") == "duplicate"]
+        failed_results = [r for r in index_results if r.get("status") == "failed"]
+        vector_summary: dict[str, Any] = {
+            "started_at": stage_timings["parse_started_at"],
+            "finished_at": stage_timings["parse_finished_at"],
+            "total_documents": len(index_results),
+            "indexed_documents": len(indexed_results),
+            "duplicate_documents": len(duplicate_results),
+            "failed_documents": len(failed_results),
+            "documents": [r.get("record", r) for r in index_results],
+            "comparisons": [r["comparison"] for r in indexed_results if r.get("comparison")],
+        }
+
+        total_vector_documents = len(index_results)
+        ready_documents = len(indexed_results) + len(duplicate_results)
+        failed_vector_documents = len(failed_results)
         qa_ready = total_vector_documents > 0 and ready_documents >= total_vector_documents and failed_vector_documents == 0
         stage_timings["qa_ready"] = qa_ready
         if qa_ready:
@@ -334,6 +365,160 @@ class ReviewSessionManager:
                 return payload
         return None
 
+    def get_document_source_path(self, *, document_id: str = "", source_name: str = "") -> Path | None:
+        payload = self.get_document_payload(document_id=document_id, source_name=source_name)
+        if not payload:
+            return None
+        raw_source_path = str(payload.get("source_path") or "").strip()
+        if not raw_source_path:
+            return None
+        candidate = Path(raw_source_path)
+        if not candidate.is_absolute():
+            candidate = (self.project_root / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        try:
+            candidate.relative_to(self.project_root.resolve())
+        except ValueError:
+            return None
+        return candidate if candidate.exists() else None
+
+    _LIBREOFFICE_CANDIDATES = [
+        Path("C:/Program Files/LibreOffice/program/soffice.exe"),
+        Path("C:/Program Files (x86)/LibreOffice/program/soffice.exe"),
+    ]
+    _LIBREOFFICE_CONVERTIBLE = {".doc", ".docx", ".hwp", ".hwpx"}
+
+    def _find_libreoffice(self) -> Path | None:
+        for candidate in self._LIBREOFFICE_CANDIDATES:
+            if candidate.exists():
+                return candidate
+        found = shutil.which("soffice")
+        return Path(found) if found else None
+
+    def convert_source_to_pdf(self, source_path: Path, dest_path: Path) -> bool:
+        """LibreOffice로 doc/docx/hwp/hwpx → PDF 변환. 성공 시 True 반환."""
+        soffice = self._find_libreoffice()
+        if not soffice:
+            return False
+        try:
+            result = subprocess.run(
+                [
+                    str(soffice),
+                    "--headless",
+                    "--convert-to", "pdf",
+                    "--outdir", str(dest_path.parent),
+                    str(source_path),
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            converted = dest_path.parent / (source_path.stem + ".pdf")
+            if converted.exists() and converted != dest_path:
+                converted.rename(dest_path)
+            return dest_path.exists()
+        except Exception:
+            return False
+
+    def get_document_preview_pdf_path(self, *, document_id: str = "", source_name: str = "") -> Path | None:
+        payload = self.get_document_payload(document_id=document_id, source_name=source_name)
+        if not payload:
+            return None
+        target_document_id = str(payload.get("document_id") or document_id or "").strip()
+        if not target_document_id:
+            return None
+        preview_path = self.preview_root / f"{target_document_id}.pdf"
+        if preview_path.exists():
+            return preview_path
+
+        # doc/docx/hwp/hwpx → LibreOffice로 직접 변환
+        source_path = self.get_document_source_path(document_id=document_id, source_name=source_name)
+        if source_path and source_path.suffix.lower() in self._LIBREOFFICE_CONVERTIBLE:
+            if self.convert_source_to_pdf(source_path, preview_path):
+                return preview_path
+
+        markdown = str(payload.get("markdown") or "").strip()
+        if not markdown:
+            return None
+
+        font_path: Path | None = None
+        for candidate in (
+            Path("C:/Windows/Fonts/malgun.ttf"),
+            Path("C:/Windows/Fonts/NanumGothic.ttf"),
+            Path("C:/Windows/Fonts/arial.ttf"),
+        ):
+            if candidate.exists():
+                font_path = candidate
+                break
+
+        document = fitz.open()
+        try:
+            page_width = 595
+            page_height = 842
+            margin = 40
+            cursor_y = margin
+            page = document.new_page(width=page_width, height=page_height)
+            font_name = "previewfont"
+            if font_path:
+                page.insert_font(fontname=font_name, fontfile=str(font_path))
+            else:
+                font_name = "helv"
+            shape = page.new_shape()
+
+            normalized_lines: list[str] = []
+            for block in markdown.splitlines():
+                line = block.rstrip()
+                if len(line) <= 92:
+                    normalized_lines.append(line)
+                    continue
+                while len(line) > 92:
+                    normalized_lines.append(line[:92])
+                    line = line[92:]
+                normalized_lines.append(line)
+
+            for raw_line in normalized_lines:
+                line = raw_line or " "
+                box = fitz.Rect(margin, cursor_y, page_width - margin, cursor_y + 20)
+                overflow = shape.insert_textbox(
+                    box,
+                    line,
+                    fontsize=10,
+                    fontname=font_name,
+                    color=(0.12, 0.16, 0.23),
+                    lineheight=1.35,
+                )
+                if overflow < 0:
+                    shape.commit()
+                    page = document.new_page(width=page_width, height=page_height)
+                    if font_path:
+                        page.insert_font(fontname=font_name, fontfile=str(font_path))
+                    shape = page.new_shape()
+                    cursor_y = margin
+                    box = fitz.Rect(margin, cursor_y, page_width - margin, cursor_y + 20)
+                    shape.insert_textbox(
+                        box,
+                        line,
+                        fontsize=10,
+                        fontname=font_name,
+                        color=(0.12, 0.16, 0.23),
+                        lineheight=1.35,
+                    )
+                cursor_y += 16
+                if cursor_y >= page_height - margin - 20:
+                    shape.commit()
+                    page = document.new_page(width=page_width, height=page_height)
+                    if font_path:
+                        page.insert_font(fontname=font_name, fontfile=str(font_path))
+                    shape = page.new_shape()
+                    cursor_y = margin
+
+            shape.commit()
+            document.save(preview_path)
+        finally:
+            document.close()
+
+        return preview_path if preview_path.exists() else None
+
     def delete_document_files(self, document_id: str) -> int:
         """Delete structured JSON files for the given document_id. Returns count of removed files."""
         removed = 0
@@ -444,6 +629,8 @@ class ReviewSessionManager:
         raw_parts = [part for part in PurePosixPath(unquote(request_path)).parts if part not in {"", "/", "."}]
         if not raw_parts:
             return None
+        if raw_parts[0] == "static":
+            return self._resolve_relative_path(self.project_root / "src" / "ui" / "static", list(raw_parts[1:]))
         if raw_parts[0] == "project-review":
             return self._resolve_relative_path(self.project_review_root, list(raw_parts[1:]) or ["index.html"])
         if raw_parts[0] == "project-parsing":

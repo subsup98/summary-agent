@@ -1,0 +1,303 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="3380" viewBox="0 0 2400 3380" role="img" aria-labelledby="title desc">
+  <title id="title">Document Studio Verified Workflow</title>
+  <desc id="desc">Verified workflow diagram for the summary_agent response_github_bundle project. The diagram reflects the actual upload, parsing, vector indexing, summary, and QA flow implemented in the codebase.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 28; filter: url(#shadow); }
+      .section { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 2.5; stroke-dasharray: 10 8; rx: 28; }
+      .title { font: 700 34px 'Segoe UI', 'Malgun Gothic', Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 18px 'Segoe UI', 'Malgun Gothic', Arial, sans-serif; fill: #475569; }
+      .legend { font: 600 16px 'Segoe UI', 'Malgun Gothic', Arial, sans-serif; fill: #0f172a; }
+      .note { font: 500 17px 'Segoe UI', 'Malgun Gothic', Arial, sans-serif; fill: #334155; }
+      .small { font: 500 15px 'Segoe UI', 'Malgun Gothic', Arial, sans-serif; fill: #475569; }
+      .boxtext { font: 700 19px 'Segoe UI', 'Malgun Gothic', Arial, sans-serif; fill: #0f172a; text-anchor: middle; }
+      .boxsub { font: 500 15px 'Segoe UI', 'Malgun Gothic', Arial, sans-serif; fill: #334155; text-anchor: middle; }
+      .label { font: 700 20px 'Segoe UI', 'Malgun Gothic', Arial, sans-serif; fill: #0f172a; }
+      .mono { font-family: Consolas, 'Cascadia Code', monospace; }
+      .line { stroke: #334155; stroke-width: 3.5; fill: none; marker-end: url(#arrow); }
+      .thin { stroke-width: 2.5; }
+      .ui { fill: #e0f2fe; stroke: #0284c7; stroke-width: 2.5; rx: 22; }
+      .api { fill: #ede9fe; stroke: #7c3aed; stroke-width: 2.5; rx: 22; }
+      .job { fill: #fef3c7; stroke: #d97706; stroke-width: 2.5; rx: 22; }
+      .parse { fill: #dcfce7; stroke: #16a34a; stroke-width: 2.5; rx: 22; }
+      .index { fill: #fee2e2; stroke: #dc2626; stroke-width: 2.5; rx: 22; }
+      .result { fill: #e2e8f0; stroke: #475569; stroke-width: 2.5; rx: 22; }
+      .branch { fill: #fce7f3; stroke: #db2777; stroke-width: 2.5; rx: 22; }
+      .decision { fill: #fff7ed; stroke: #ea580c; stroke-width: 2.5; }
+      .legend-ui { fill: #e0f2fe; stroke: #0284c7; stroke-width: 2; }
+      .legend-api { fill: #ede9fe; stroke: #7c3aed; stroke-width: 2; }
+      .legend-job { fill: #fef3c7; stroke: #d97706; stroke-width: 2; }
+      .legend-parse { fill: #dcfce7; stroke: #16a34a; stroke-width: 2; }
+      .legend-index { fill: #fee2e2; stroke: #dc2626; stroke-width: 2; }
+      .legend-branch { fill: #fce7f3; stroke: #db2777; stroke-width: 2; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="2400" height="3380"/>
+  <rect class="panel" x="40" y="40" width="2320" height="3300"/>
+
+  <text class="title" x="90" y="95">Document Studio Workflow (Verified Against Code)</text>
+  <text class="subtitle" x="90" y="130">Sources checked: response.py, src/ui/review_server.py, src/pipeline/parsing_pipeline.py, src/indexing/chroma_store.py, src/retreival_lanchain/retrieval_qa.py, src/retrieval/chroma_retriever.py</text>
+
+  <g transform="translate(1540 72)">
+    <rect x="0" y="0" width="760" height="96" rx="18" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+    <rect class="legend-ui" x="20" y="20" width="26" height="18" rx="6"/>
+    <text class="legend" x="58" y="34">UI / Browser</text>
+    <rect class="legend-api" x="210" y="20" width="26" height="18" rx="6"/>
+    <text class="legend" x="248" y="34">API</text>
+    <rect class="legend-job" x="330" y="20" width="26" height="18" rx="6"/>
+    <text class="legend" x="368" y="34">Session / Job</text>
+    <rect class="legend-parse" x="520" y="20" width="26" height="18" rx="6"/>
+    <text class="legend" x="558" y="34">Parsing</text>
+    <rect class="legend-index" x="20" y="56" width="26" height="18" rx="6"/>
+    <text class="legend" x="58" y="70">Vector Index</text>
+    <rect class="legend-branch" x="210" y="56" width="26" height="18" rx="6"/>
+    <text class="legend" x="248" y="70">Summary / QA</text>
+    <text class="small" x="520" y="70">Main correction: QA main path is <tspan class="mono">/api/query</tspan>, not only <tspan class="mono">/api/query-compare</tspan>.</text>
+  </g>
+
+  <g>
+    <rect class="ui" x="1060" y="200" width="280" height="64" rx="30"/>
+    <text class="boxtext" x="1200" y="240">프로그램 실행</text>
+
+    <rect class="job" x="940" y="320" width="520" height="84"/>
+    <text class="boxtext" x="1200" y="356">서버 시작</text>
+    <text class="boxsub" x="1200" y="380"><tspan class="mono">response.py main()</tspan> + LangChain warmup</text>
+
+    <rect class="ui" x="940" y="460" width="520" height="84"/>
+    <text class="boxtext" x="1200" y="496">브라우저 UI 접속</text>
+    <text class="boxsub" x="1200" y="520"><tspan class="mono">/</tspan> Document Studio</text>
+
+    <rect class="api" x="940" y="600" width="520" height="84"/>
+    <text class="boxtext" x="1200" y="636">문서 목록 요청</text>
+    <text class="boxsub mono" x="1200" y="660">GET /api/documents</text>
+
+    <rect class="job" x="940" y="740" width="520" height="84"/>
+    <text class="boxtext" x="1200" y="776">구조화 문서 조회</text>
+    <text class="boxsub" x="1200" y="800">project + <tspan class="mono">outputs/ui_runs/*/structured/documents</tspan></text>
+
+    <rect class="ui" x="940" y="880" width="520" height="84"/>
+    <text class="boxtext" x="1200" y="916">문서 목록 표시</text>
+    <text class="boxsub" x="1200" y="940">basic / llm / ui summary cache 포함</text>
+
+    <rect class="ui" x="940" y="1020" width="520" height="84"/>
+    <text class="boxtext" x="1200" y="1056">사용자 문서 업로드</text>
+    <text class="boxsub" x="1200" y="1080">drag-and-drop 또는 파일 선택</text>
+
+    <rect class="api" x="940" y="1160" width="520" height="84"/>
+    <text class="boxtext" x="1200" y="1196">업로드 API 호출</text>
+    <text class="boxsub mono" x="1200" y="1220">POST /api/run</text>
+
+    <rect class="job" x="870" y="1300" width="660" height="96"/>
+    <text class="boxtext" x="1200" y="1338">업로드 저장 + run_id 생성 + 백그라운드 작업 시작</text>
+    <text class="boxsub" x="1200" y="1362"><tspan class="mono">ReviewSessionManager.start_run()</tspan> -&gt; worker thread</text>
+  </g>
+
+  <path class="line" d="M 1200 264 L 1200 320"/>
+  <path class="line" d="M 1200 404 L 1200 460"/>
+  <path class="line" d="M 1200 544 L 1200 600"/>
+  <path class="line" d="M 1200 684 L 1200 740"/>
+  <path class="line" d="M 1200 824 L 1200 880"/>
+  <path class="line" d="M 1200 964 L 1200 1020"/>
+  <path class="line" d="M 1200 1104 L 1200 1160"/>
+  <path class="line" d="M 1200 1244 L 1200 1300"/>
+
+  <g>
+    <rect class="section" x="90" y="1450" width="2220" height="600" rx="28"/>
+    <text class="label" x="130" y="1490">1. 업로드 작업 오케스트레이션 + Parsing Pipeline</text>
+
+    <rect class="job" x="120" y="1520" width="360" height="86"/>
+    <text class="boxtext" x="300" y="1558">기존 프로젝트 결과 sync</text>
+    <text class="boxsub" x="300" y="1582"><tspan class="mono">data/structured/documents</tspan> -&gt; vector DB</text>
+
+    <rect class="job" x="560" y="1520" width="360" height="86"/>
+    <text class="boxtext" x="740" y="1558">업로드 중복 검사</text>
+    <text class="boxsub" x="740" y="1582">source hash 기준 사전 중복 판정</text>
+
+    <rect class="parse" x="1000" y="1520" width="360" height="86"/>
+    <text class="boxtext" x="1180" y="1558">문서 탐색</text>
+    <text class="boxsub" x="1180" y="1582"><tspan class="mono">DocumentLoader.discover_documents()</tspan></text>
+
+    <rect class="parse" x="1440" y="1520" width="360" height="86"/>
+    <text class="boxtext" x="1620" y="1558">문서 분류</text>
+    <text class="boxsub" x="1620" y="1582">PDF / DOCX / DOC / HWP / TXT</text>
+
+    <rect class="parse" x="1880" y="1520" width="360" height="86"/>
+    <text class="boxtext" x="2060" y="1548">파서 선택 + 파싱</text>
+    <text class="boxsub" x="2060" y="1570">PDF, Office, Text, fallback</text>
+    <text class="boxsub" x="2060" y="1590">classification.parser_route 기반</text>
+
+    <rect class="parse" x="230" y="1690" width="360" height="86"/>
+    <text class="boxtext" x="410" y="1728">basic summary 생성</text>
+    <text class="boxsub" x="410" y="1752"><tspan class="mono">ensure_basic_summary()</tspan></text>
+
+    <rect class="parse" x="670" y="1690" width="360" height="86"/>
+    <text class="boxtext" x="850" y="1728">semantic chunk 생성</text>
+    <text class="boxsub" x="850" y="1752"><tspan class="mono">build_semantic_chunks()</tspan></text>
+
+    <rect class="parse" x="1110" y="1690" width="360" height="86"/>
+    <text class="boxtext" x="1290" y="1718">구조화 결과 저장</text>
+    <text class="boxsub" x="1290" y="1740">structured JSON + output JSON</text>
+    <text class="boxsub" x="1290" y="1760">markdown 파일 저장</text>
+
+    <rect class="parse" x="1550" y="1690" width="360" height="86"/>
+    <text class="boxtext" x="1730" y="1718">리포트 생성</text>
+    <text class="boxsub" x="1730" y="1740">PDF overlay review</text>
+    <text class="boxsub" x="1730" y="1760">parsing review</text>
+
+    <rect class="result" x="1990" y="1690" width="250" height="86"/>
+    <text class="boxtext" x="2115" y="1728">파싱 완료</text>
+    <text class="boxsub" x="2115" y="1752">run summary 기록</text>
+
+    <rect class="result" x="300" y="1860" width="1800" height="116" rx="24"/>
+    <text class="boxtext" x="1200" y="1900">파이프라인 산출물</text>
+    <text class="boxsub" x="1200" y="1928">문서별 structured JSON, markdown, timings, review site, latest_run.json / latest_run.md</text>
+    <text class="boxsub" x="1200" y="1954">주의: 초안과 달리 여기서 이미 basic summary와 semantic chunks가 함께 생성됩니다.</text>
+  </g>
+
+  <path class="line" d="M 1200 1396 L 1200 1450"/>
+  <path class="line thin" d="M 480 1563 L 560 1563"/>
+  <path class="line thin" d="M 920 1563 L 1000 1563"/>
+  <path class="line thin" d="M 1360 1563 L 1440 1563"/>
+  <path class="line thin" d="M 1800 1563 L 1880 1563"/>
+  <path class="line thin" d="M 2060 1606 L 2060 1690"/>
+  <path class="line thin" d="M 1880 1733 L 1990 1733"/>
+  <path class="line thin" d="M 1550 1733 L 1470 1733"/>
+  <path class="line thin" d="M 1110 1733 L 1030 1733"/>
+  <path class="line thin" d="M 670 1733 L 590 1733"/>
+  <path class="line thin" d="M 2115 1776 L 2115 1860"/>
+
+  <g>
+    <rect class="section" x="90" y="2080" width="2220" height="430" rx="28"/>
+    <text class="label" x="130" y="2120">2. Vector Indexing</text>
+
+    <rect class="index" x="140" y="2160" width="320" height="86"/>
+    <text class="boxtext" x="300" y="2198">structured JSON 로드</text>
+    <text class="boxsub" x="300" y="2222"><tspan class="mono">session/structured/documents/*.json</tspan></text>
+
+    <rect class="index" x="520" y="2160" width="320" height="86"/>
+    <text class="boxtext" x="680" y="2198">중복 판정</text>
+    <text class="boxsub" x="680" y="2222">source hash + content hash</text>
+
+    <rect class="index" x="900" y="2160" width="320" height="86"/>
+    <text class="boxtext" x="1060" y="2198">chunk 준비</text>
+    <text class="boxsub" x="1060" y="2222">rule-based + semantic</text>
+
+    <rect class="index" x="1280" y="2160" width="320" height="86"/>
+    <text class="boxtext" x="1440" y="2198">임베딩 생성</text>
+    <text class="boxsub" x="1440" y="2222">embedding backend 사용</text>
+
+    <rect class="index" x="1660" y="2160" width="320" height="86"/>
+    <text class="boxtext" x="1820" y="2188">Chroma 저장</text>
+    <text class="boxsub" x="1820" y="2210">rule collection</text>
+    <text class="boxsub" x="1820" y="2230">semantic collection</text>
+
+    <rect class="index" x="2040" y="2160" width="220" height="86"/>
+    <text class="boxtext" x="2150" y="2198">registry 갱신</text>
+    <text class="boxsub" x="2150" y="2222">index report 저장</text>
+
+    <rect class="job" x="600" y="2325" width="1200" height="108" rx="24"/>
+    <text class="boxtext" x="1200" y="2362">세션 결과 저장 + QA ready 계산</text>
+    <text class="boxsub" x="1200" y="2388"><tspan class="mono">session.json</tspan>, <tspan class="mono">latest_session.json</tspan>, timings, vector_index summary</text>
+    <text class="boxsub" x="1200" y="2414">중요한 차이: 벡터 DB에는 semantic만이 아니라 rule-based collection도 함께 유지됩니다.</text>
+  </g>
+
+  <path class="line" d="M 1200 1976 L 1200 2080"/>
+  <path class="line thin" d="M 460 2203 L 520 2203"/>
+  <path class="line thin" d="M 840 2203 L 900 2203"/>
+  <path class="line thin" d="M 1220 2203 L 1280 2203"/>
+  <path class="line thin" d="M 1600 2203 L 1660 2203"/>
+  <path class="line thin" d="M 1980 2203 L 2040 2203"/>
+  <path class="line thin" d="M 2150 2246 L 2150 2325"/>
+
+  <g>
+    <rect class="job" x="860" y="2550" width="680" height="96"/>
+    <text class="boxtext" x="1200" y="2588">상태 갱신 + SSE + job polling 완료</text>
+    <text class="boxsub" x="1200" y="2612"><tspan class="mono">documents_updated</tspan> event + <tspan class="mono">/api/jobs/{job_id}</tspan> polling</text>
+
+    <rect class="ui" x="860" y="2695" width="680" height="96"/>
+    <text class="boxtext" x="1200" y="2733">문서 목록 새로고침 + 신규 문서 자동 요약 시작</text>
+    <text class="boxsub" x="1200" y="2757"><tspan class="mono">loadDocuments()</tspan> + summary cache reset + autoSummarize</text>
+  </g>
+
+  <path class="line" d="M 1200 2433 L 1200 2550"/>
+  <path class="line" d="M 1200 2646 L 1200 2695"/>
+
+  <g>
+    <path class="line" d="M 1200 2791 L 760 2870"/>
+    <path class="line" d="M 1200 2791 L 1640 2870"/>
+
+    <rect class="branch" x="170" y="2870" width="520" height="86"/>
+    <text class="boxtext" x="430" y="2908">문서 요약 요청</text>
+    <text class="boxsub mono" x="430" y="2932">POST /api/summarize</text>
+
+    <polygon class="decision" points="860,2913 980,2835 1100,2913 980,2991"/>
+    <text class="boxtext" x="980" y="2906">캐시 있음?</text>
+    <text class="boxsub" x="980" y="2928">ui / llm / basic</text>
+
+    <rect class="branch" x="1170" y="2870" width="520" height="86"/>
+    <text class="boxtext" x="1430" y="2908">질문 요청</text>
+    <text class="boxsub mono" x="1430" y="2932">POST /api/query</text>
+
+    <polygon class="decision" points="1860,2913 1980,2835 2100,2913 1980,2991"/>
+    <text class="boxtext" x="1980" y="2906">LangChain 가능?</text>
+    <text class="boxsub" x="1980" y="2928">OPENAI / service ready</text>
+  </g>
+
+  <path class="line thin" d="M 690 2913 L 860 2913"/>
+  <path class="line thin" d="M 1690 2913 L 1860 2913"/>
+
+  <g>
+    <text class="small" x="1040" y="2860">yes</text>
+    <path class="line thin" d="M 980 2991 L 980 3050"/>
+    <rect class="branch" x="720" y="3050" width="520" height="86"/>
+    <text class="boxtext" x="980" y="3088">즉시 반환</text>
+    <text class="boxsub" x="980" y="3112">cached summary payload</text>
+
+    <text class="small" x="1120" y="2950">no</text>
+    <path class="line thin" d="M 1100 2913 L 1240 2913 L 1240 3050"/>
+    <rect class="branch" x="1240" y="3050" width="520" height="86"/>
+    <text class="boxtext" x="1500" y="3078">LangChain 요약 또는 basic fallback</text>
+    <text class="boxsub" x="1500" y="3100">OpenAI 사용 가능 시 <tspan class="mono">summarize_document()</tspan>, 결과는 <tspan class="mono">ui_summary</tspan>로 캐시</text>
+  </g>
+
+  <g>
+    <text class="small" x="2040" y="2860">yes</text>
+    <path class="line thin" d="M 1980 2991 L 1980 3050"/>
+    <rect class="branch" x="1720" y="3050" width="520" height="86"/>
+    <text class="boxtext" x="1980" y="3078">LangChain RAG 경로</text>
+    <text class="boxsub" x="1980" y="3100">semantic Chroma retrieval + optional reranker + ChatOpenAI answer</text>
+
+    <text class="small" x="2120" y="2950">no</text>
+    <path class="line thin" d="M 2100 2913 L 2250 2913 L 2250 2970"/>
+    <rect class="branch" x="1660" y="3165" width="580" height="86"/>
+    <text class="boxtext" x="1950" y="3200">Custom retriever fallback</text>
+    <text class="boxsub" x="1950" y="3224">Chroma search + evidence ranking + OpenAIAnswerSynthesizer or local fallback</text>
+    <path class="line thin" d="M 2250 2970 L 2250 3165"/>
+  </g>
+
+  <g>
+    <rect class="result" x="60" y="2870" width="70" height="381" rx="18"/>
+    <text class="small" transform="translate(107 3060) rotate(-90)" text-anchor="middle">Summary lane</text>
+
+    <rect class="result" x="1500" y="2870" width="70" height="381" rx="18"/>
+    <text class="small" transform="translate(1547 3060) rotate(-90)" text-anchor="middle">QA lane</text>
+  </g>
+
+  <g transform="translate(90 2490)">
+    <rect x="0" y="0" width="700" height="220" rx="24" fill="#ffffff" stroke="#cbd5e1" stroke-width="2.5"/>
+    <text class="label" x="26" y="36">검증 결과 요약</text>
+    <text class="note" x="26" y="72">1. 문서 목록 조회는 구조화 JSON 스캔이 맞습니다.</text>
+    <text class="note" x="26" y="104">2. 업로드 뒤에는 parsing 전에 기존 project structured docs를 vector DB와 sync합니다.</text>
+    <text class="note" x="26" y="136">3. summary는 항상 새로 생성되지 않고 cache(ui_summary / llm_summary / basic_summary)를 우선 사용합니다.</text>
+    <text class="note" x="26" y="168">4. QA 메인 UI는 <tspan class="mono">/api/query</tspan>를 호출하고, <tspan class="mono">/api/query-compare</tspan>는 비교용 보조 엔드포인트입니다.</text>
+    <text class="note" x="26" y="200">5. vector indexing은 rule-based + semantic 두 컬렉션을 모두 유지합니다.</text>
+  </g>
+</svg>

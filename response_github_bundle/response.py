@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import cgi
+import html
 import json
 import math
 import mimetypes
@@ -15,10 +16,12 @@ from datetime import datetime
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 
 ROOT = Path(__file__).resolve().parent
+UI_ROOT = ROOT / "src" / "ui"
+DOCUMENT_STUDIO_TEMPLATE_PATH = UI_ROOT / "templates" / "document_studio.html"
 SERVER_ERROR_LOG = ROOT / "outputs" / "document_studio_server_errors.log"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -29,6 +32,14 @@ from src.ui.review_server import ReviewSessionManager, UploadedDocument  # noqa:
 
 
 DEFAULT_QA_STRATEGY = "semantic"
+
+
+def is_semantic_strategy_available() -> bool:
+    try:
+        import sentence_transformers  # type: ignore  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 def log_server_exception(context: str, error: Exception) -> None:
@@ -51,6 +62,17 @@ def make_json_safe(value: object) -> object:
     if isinstance(value, (list, tuple, set)):
         return [make_json_safe(item) for item in value]
     return str(value)
+
+
+def _load_ui_template(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _render_ui_template(path: Path, replacements: dict[str, str]) -> str:
+    content = _load_ui_template(path)
+    for key, value in replacements.items():
+        content = content.replace(f"{{{{{key}}}}}", value)
+    return content
 
 
 def build_openapi_spec(host: str, port: int) -> dict[str, object]:
@@ -552,7 +574,7 @@ class LazyLangChainService:
                 }
 
 
-def render_document_studio_html(status: dict[str, object]) -> str:
+def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     project_review = status.get("project_review") or {}
     latest_upload = status.get("latest_upload") or {}
     openai_status = status.get("openai") or {}
@@ -2576,6 +2598,35 @@ def render_document_studio_html(status: dict[str, object]) -> str:
     )
 
 
+def render_document_studio_html(status: dict[str, object]) -> str:
+    project_review = status.get("project_review") or {}
+    latest_upload = status.get("latest_upload") or {}
+    openai_status = status.get("openai") or {}
+    semantic_ready = is_semantic_strategy_available()
+
+    qa_caption = ""
+
+    initial_status = make_json_safe(
+        {
+            "project_review": project_review,
+            "latest_upload": latest_upload,
+            "openai": openai_status,
+            "qa_caption": qa_caption,
+            "semantic_ready": semantic_ready,
+        }
+    )
+    initial_status_json = json.dumps(initial_status, ensure_ascii=False).replace("</", "<\\/")
+
+    return _render_ui_template(
+        DOCUMENT_STUDIO_TEMPLATE_PATH,
+        {
+            "INITIAL_STATUS_JSON": initial_status_json,
+            "SUPPORTED_ACCEPT": html.escape(",".join(sorted(SUPPORTED_EXTENSIONS)), quote=True),
+            "DEFAULT_QA_STRATEGY": html.escape(DEFAULT_QA_STRATEGY, quote=True),
+        },
+    )
+
+
 class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
     server_version = "DocumentStudio/1.0.0"
 
@@ -2611,6 +2662,12 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/documents":
                 self._send_json({"documents": self.manager.get_document_list()})
+                return
+            if path == "/api/document-content":
+                self._handle_document_content()
+                return
+            if path == "/api/document-original":
+                self._handle_document_original()
                 return
             if path == "/api/download-summary":
                 self._handle_download_summary()
@@ -2783,6 +2840,47 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             log_server_exception(f"GET {self.path}", error)
             self._send_json({"error": str(error)}, status=500)
 
+    def _handle_document_content(self) -> None:
+        try:
+            query = parse_qs(urlparse(self.path).query)
+            document_id = str((query.get("document_id") or [""])[0]).strip()
+            source_name = str((query.get("source_name") or [""])[0]).strip()
+            if not document_id and not source_name:
+                self._send_json({"error": "document_id_or_source_name_required"}, status=400)
+                return
+            payload = self.manager.get_document_payload(document_id=document_id, source_name=source_name)
+            if not payload:
+                self._send_json({"error": "document_not_found"}, status=404)
+                return
+            self._send_json(self._build_document_content_payload(payload), status=200)
+        except Exception as error:
+            log_server_exception(f"GET {self.path}", error)
+            self._send_json({"error": str(error)}, status=500)
+
+    def _handle_document_original(self) -> None:
+        try:
+            query = parse_qs(urlparse(self.path).query)
+            document_id = str((query.get("document_id") or [""])[0]).strip()
+            source_name = str((query.get("source_name") or [""])[0]).strip()
+            if not document_id and not source_name:
+                self._send_json({"error": "document_id_or_source_name_required"}, status=400)
+                return
+            source_path = self.manager.get_document_source_path(document_id=document_id, source_name=source_name)
+            if source_path and source_path.suffix.lower() == ".pdf":
+                self._serve_file(source_path)
+                return
+            preview_path = self.manager.get_document_preview_pdf_path(document_id=document_id, source_name=source_name)
+            if preview_path:
+                self._serve_file(preview_path)
+                return
+            if source_path:
+                self._serve_file(source_path)
+                return
+            self._send_json({"error": "document_original_not_found"}, status=404)
+        except Exception as error:
+            log_server_exception(f"GET {self.path}", error)
+            self._send_json({"error": str(error)}, status=500)
+
     def _build_cached_summary_payload(
         self,
         payload: dict[str, object],
@@ -2873,6 +2971,36 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             "used_model": summary.get("used_model") or ("cached_llm_summary" if llm_summary else "cached_basic_summary"),
         }
 
+    def _build_document_content_payload(self, payload: dict[str, object]) -> dict[str, object]:
+        basic_summary = payload.get("basic_summary") if isinstance(payload.get("basic_summary"), dict) else {}
+        llm_summary = payload.get("llm_summary") if isinstance(payload.get("llm_summary"), dict) else {}
+        ui_summary = payload.get("ui_summary") if isinstance(payload.get("ui_summary"), dict) else {}
+        preferred_summary = ui_summary or llm_summary or basic_summary or {}
+        sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
+        normalized_sections = []
+        for item in sections[:8]:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            if title:
+                normalized_sections.append(title)
+        key_points = preferred_summary.get("key_points") or preferred_summary.get("highlights") or []
+        return {
+            "document_id": payload.get("document_id", ""),
+            "source_name": payload.get("source_name", ""),
+            "document_type": (payload.get("classification") or {}).get("document_type", "") or payload.get("extension", ""),
+            "origin": payload.get("origin", ""),
+            "summary_text": preferred_summary.get("summary_text", ""),
+            "key_points": [str(item).strip() for item in key_points if str(item).strip()][:6],
+            "section_titles": normalized_sections,
+            "markdown": str(payload.get("markdown") or ""),
+            "original_url": "/api/document-original?document_id={document_id}&source_name={source_name}".format(
+                document_id=quote(str(payload.get("document_id", ""))),
+                source_name=quote(str(payload.get("source_name", ""))),
+            ),
+            "extension": str(payload.get("extension") or ""),
+        }
+
     def _build_summary_markdown(
         self,
         source_label: str,
@@ -2939,34 +3067,38 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             payload = self._read_json_payload()
             query = str(payload.get("query", "")).strip()
             strategy = str(payload.get("strategy", DEFAULT_QA_STRATEGY)).strip() or DEFAULT_QA_STRATEGY
+            if strategy == "semantic" and not is_semantic_strategy_available():
+                strategy = "rule_based"
             document_id = str(payload.get("document_id", "")).strip()
             source_name = str(payload.get("source_name", "")).strip()
             selected_document_ids = [str(item).strip() for item in (payload.get("selected_document_ids") or []) if str(item).strip()]
             if not query:
                 self._send_json({"error": "query_is_required"}, status=400)
                 return
-            if self.langchain_service is not None:
-                self._prime_query_summaries(
-                    document_id=document_id,
-                    source_name=source_name,
-                    selected_document_ids=selected_document_ids,
-                )
-                answer = self.langchain_service.answer_question(
+            def _run_answer(selected_strategy: str, *, use_reranker: bool = True, force_local: bool = False) -> dict[str, object]:
+                if self.langchain_service is not None and not force_local:
+                    self._prime_query_summaries(
+                        document_id=document_id,
+                        source_name=source_name,
+                        selected_document_ids=selected_document_ids,
+                    )
+                    return self.langchain_service.answer_question(
+                        query=query,
+                        strategy=selected_strategy,
+                        document_id=document_id,
+                        source_name=source_name,
+                        document_ids=selected_document_ids,
+                        use_reranker=use_reranker,
+                    )
+                return self.retriever.answer_question(
                     query=query,
-                    strategy=strategy,
+                    strategy=selected_strategy,
                     document_id=document_id,
                     source_name=source_name,
                     document_ids=selected_document_ids,
-                    use_reranker=True,
                 )
-            else:
-                answer = self.retriever.answer_question(
-                    query=query,
-                    strategy=strategy,
-                    document_id=document_id,
-                    source_name=source_name,
-                    document_ids=selected_document_ids,
-                )
+
+            answer = _run_answer(strategy)
         except ValueError as error:
             self._send_json({"error": str(error)}, status=400)
             return
