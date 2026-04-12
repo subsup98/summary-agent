@@ -24,6 +24,10 @@ DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 OPENAI_EMBEDDING_BATCH_TOKEN_LIMIT = 6000
 
 
+def _open_url(req: request.Request, timeout: int) -> Any:
+    return request.urlopen(req, timeout=timeout)
+
+
 class EmbeddingBackend(Protocol):
     model_name: str
 
@@ -101,7 +105,7 @@ class OpenAIEmbeddingBackend(Embeddings):
 
         def _do_request() -> dict:
             try:
-                with request.urlopen(req, timeout=120) as response:
+                with _open_url(req, timeout=120) as response:
                     return json.loads(response.read().decode("utf-8"))
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")

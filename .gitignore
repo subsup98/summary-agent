@@ -21,3 +21,9 @@ data/
 
 # IDE
 .vscode/
+
+# Docs (large PDF/document files)
+docs/
+
+# Log files
+*.log

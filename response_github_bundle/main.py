@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
@@ -7,6 +7,8 @@ import html
 import json
 import math
 import mimetypes
+import os
+import re
 import shutil
 import socket
 import sys
@@ -18,6 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
+import fitz
+
 
 ROOT = Path(__file__).resolve().parent
 UI_ROOT = ROOT / "src" / "ui"
@@ -27,6 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.retrieval.chroma_retriever import ChromaRetriever  # noqa: E402
+from src.parsers.pdf.markdown_extractor import PdfMarkdownExtractor  # noqa: E402
 from src.shared.constants import SUPPORTED_EXTENSIONS  # noqa: E402
 from src.ui.review_server import ReviewSessionManager, UploadedDocument  # noqa: E402
 
@@ -40,6 +45,11 @@ def is_semantic_strategy_available() -> bool:
     except Exception:
         return False
     return True
+
+
+def clear_process_proxy_env() -> None:
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        os.environ.pop(key, None)
 
 
 def log_server_exception(context: str, error: Exception) -> None:
@@ -62,6 +72,136 @@ def make_json_safe(value: object) -> object:
     if isinstance(value, (list, tuple, set)):
         return [make_json_safe(item) for item in value]
     return str(value)
+
+
+def clean_viewer_markdown(markdown: str) -> str:
+    cleaned_lines: list[str] = []
+    skip_unit_line = False
+    for raw_line in str(markdown or "").splitlines():
+        line = raw_line
+        # Remove omitted-picture markers inline without dropping neighboring content.
+        line = re.sub(
+            r"\s*==>\s*picture\s*\[[^\]]+\]\s*intentionally omitted\s*<==\s*",
+            " ",
+            line,
+            flags=re.IGNORECASE,
+        )
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if re.fullmatch(r"[| ]{5,}", stripped):
+            continue
+        if lowered == "end of document":
+            continue
+        if "[financial fact table]" in lowered or "[row_path]" in lowered:
+            skip_unit_line = True
+            continue
+        if skip_unit_line and re.match(r"^\(unit:\s*.*\)$", stripped, flags=re.IGNORECASE):
+            skip_unit_line = False
+            continue
+        skip_unit_line = False
+        if stripped:
+            cleaned_lines.append(line)
+    cleaned = "\n".join(cleaned_lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_match_text(text: object) -> str:
+    normalized = re.sub(r"<br\s*/?>", "\n", str(text or ""), flags=re.IGNORECASE)
+    normalized = re.sub(r"[*_`#>\-\[\]\(\)\|]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip().lower()
+
+
+def _score_text_overlap(candidate: object, target: object) -> float:
+    normalized_candidate = _normalize_match_text(candidate)
+    normalized_target = _normalize_match_text(target)
+    if not normalized_candidate or not normalized_target:
+        return -1.0
+    if normalized_candidate == normalized_target:
+        return 20000.0
+    if normalized_candidate in normalized_target:
+        return 12000.0 - abs(len(normalized_target) - len(normalized_candidate))
+    if normalized_target in normalized_candidate:
+        return 10000.0 - abs(len(normalized_candidate) - len(normalized_target))
+
+    candidate_tokens = {token for token in normalized_candidate.split(" ") if token}
+    target_tokens = [token for token in normalized_target.split(" ") if token]
+    if not candidate_tokens or not target_tokens:
+        return -1.0
+
+    overlap = 0.0
+    for token in target_tokens:
+        if token in candidate_tokens:
+            overlap += 12.0 if len(token) > 2 else 4.0
+    overlap -= abs(len(normalized_candidate) - len(normalized_target)) * 0.05
+    return overlap
+
+
+def _infer_semantic_chunk_page_numbers(
+    payload: dict[str, object],
+    normalized_chunks: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    structured_chunks = payload.get("chunks") if isinstance(payload.get("chunks"), list) else []
+    candidates: list[dict[str, object]] = []
+    for item in structured_chunks:
+        if not isinstance(item, dict):
+            continue
+        try:
+            page_number = int(item.get("page") or item.get("page_number") or 0)
+        except (TypeError, ValueError):
+            page_number = 0
+        serialized_text = clean_viewer_markdown(str(item.get("serialized_text") or ""))
+        if page_number <= 0 or not serialized_text:
+            continue
+        candidates.append(
+            {
+                "page_number": page_number,
+                "text": serialized_text,
+                "section": str(item.get("section") or ""),
+            }
+        )
+
+    if not candidates:
+        return normalized_chunks
+
+    enriched_chunks: list[dict[str, object]] = []
+    for chunk in normalized_chunks:
+        chunk_text = clean_viewer_markdown(str(chunk.get("text") or ""))
+        chunk_section = str(chunk.get("section_hint") or "")
+        best_page_number: int | None = None
+        best_score = -1.0
+        for candidate in candidates:
+            score = _score_text_overlap(candidate.get("text"), chunk_text)
+            if chunk_section and candidate.get("section") == chunk_section:
+                score += 80.0
+            if score > best_score:
+                best_score = score
+                best_page_number = int(candidate["page_number"])
+        enriched = dict(chunk)
+        if best_page_number and best_score > 0:
+            enriched["page_number"] = best_page_number
+        enriched_chunks.append(enriched)
+    return enriched_chunks
+
+
+def enrich_pdf_markdown_for_viewer(payload: dict[str, object], markdown: str) -> str:
+    source_path_raw = str(payload.get("source_path") or "").strip()
+    if not source_path_raw or "intentionally omitted <==" not in str(markdown or ""):
+        return markdown
+
+    source_path = Path(source_path_raw)
+    if not source_path.exists() or source_path.suffix.lower() != ".pdf":
+        return markdown
+
+    extractor = PdfMarkdownExtractor(enable_omitted_picture_ocr=True)
+    try:
+        with fitz.open(source_path) as document:
+            enriched_markdown, _, _ = extractor._apply_omitted_picture_ocr(source_path, markdown, document)
+            return enriched_markdown or markdown
+    except Exception as error:
+        log_server_exception("enrich_pdf_markdown_for_viewer", error)
+        return markdown
 
 
 def _load_ui_template(path: Path) -> str:
@@ -581,11 +721,11 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
 
     qa_caption = (
         (
-            "업로드 시 semantic 청킹, 임베딩 인덱싱, 문서 요약을 먼저 준비한 뒤 "
-            f"LangChain QA + Cross-Encoder reranker로 바로 질문할 수 있습니다. 현재 모델: {openai_status.get('model') or 'local fallback'}"
+            "?낅줈????semantic 泥?궧, ?꾨쿋???몃뜳?? 臾몄꽌 ?붿빟??癒쇱? 以鍮꾪븳 ??"
+            f"LangChain QA + Cross-Encoder reranker濡?諛붾줈 吏덈Ц?????덉뒿?덈떎. ?꾩옱 紐⑤뜽: {openai_status.get('model') or 'local fallback'}"
         )
         if openai_status.get("enabled")
-        else "OpenAI 연결이 없어 문서 요약과 LangChain QA를 준비하지 못했습니다. 현재는 로컬 검색 기반 응답을 대신 사용합니다."
+        else "OpenAI ?곌껐???놁뼱 臾몄꽌 ?붿빟怨?LangChain QA瑜?以鍮꾪븯吏 紐삵뻽?듬땲?? ?꾩옱??濡쒖뺄 寃??湲곕컲 ?묐떟??????ъ슜?⑸땲??"
     )
 
     return """<!doctype html>
@@ -699,7 +839,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       letter-spacing: -0.03em;
     }}
 
-    /* 문서 선택 섹션: 데스크탑에서 남은 공간 채우기 */
+    /* 臾몄꽌 ?좏깮 ?뱀뀡: ?곗뒪?ы깙?먯꽌 ?⑥? 怨듦컙 梨꾩슦湲?*/
     .sidebar-section-docs {{
       display: flex;
       flex-direction: column;
@@ -1063,7 +1203,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     }}
 
     .source-guide-label::before {{
-      content: "✦";
+      content: "??;
       font-size: 11px;
     }}
 
@@ -1080,7 +1220,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     .summary-toggle:hover {{ color: var(--navy); }}
 
     .source-guide-label::before {{
-      content: "•";
+      content: "??;
       font-size: 10px;
     }}
 
@@ -1441,7 +1581,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       display: none;
     }}
 
-    /* 세로 공간이 짧을 때 드롭존 축소 */
+    /* ?몃줈 怨듦컙??吏㏃쓣 ???쒕∼議?異뺤냼 */
     @media (max-height: 700px) {{
       .upload-dropzone {{
         padding: 10px 12px;
@@ -1494,7 +1634,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
         overflow: visible;
       }}
 
-      /* 모바일: flex 유지하되 overflow visible로 전체 표시 */
+      /* 紐⑤컮?? flex ?좎??섎릺 overflow visible濡??꾩껜 ?쒖떆 */
       .sidebar-section-docs {{
         overflow: visible;
       }}
@@ -1503,7 +1643,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
         max-height: none;
       }}
 
-      /* 모바일: 내부 스크롤 제거 → 목록 전체 표시, 페이지 스크롤로 탐색 */
+      /* 紐⑤컮?? ?대? ?ㅽ겕濡??쒓굅 ??紐⑸줉 ?꾩껜 ?쒖떆, ?섏씠吏 ?ㅽ겕濡ㅻ줈 ?먯깋 */
       #document-list {{
         max-height: none;
         overflow-y: visible;
@@ -1639,23 +1779,23 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       <div class="sidebar-workspace" id="sidebar-workspace">
         <section class="sidebar-section">
           <div class="sidebar-list-head">
-            <h3>문서 업로드</h3>
+            <h3>臾몄꽌 ?낅줈??/h3>
             <span class="sidebar-list-count">Quick Add</span>
           </div>
           <form class="sidebar-upload" id="workspace-upload-form">
             <input id="workspace-documents" name="documents" type="file" multiple accept="{accept}">
             <div id="upload-dropzone" class="upload-dropzone">
               <span class="upload-dropzone-icon">&#8659;</span>
-              <span>파일을 여기에 드래그하여 업로드</span>
-              <span style="font-size:11px; opacity:0.7;">또는 아래 버튼으로 선택</span>
+              <span>?뚯씪???ш린???쒕옒洹명븯???낅줈??/span>
+              <span style="font-size:11px; opacity:0.7;">?먮뒗 ?꾨옒 踰꾪듉?쇰줈 ?좏깮</span>
             </div>
             <div class="sidebar-upload-actions">
               <button class="circle-button" id="workspace-pick-button" type="button">+</button>
-              <button class="send-button" id="workspace-upload-button" type="submit">업로드</button>
+              <button class="send-button" id="workspace-upload-button" type="submit">?낅줈??/button>
               <div class="upload-spinner" id="upload-spinner"></div>
             </div>
             <div class="sidebar-selected-files" id="workspace-selected-files">
-              <span class="file-chip">선택된 문서가 없습니다.</span>
+              <span class="file-chip">?좏깮??臾몄꽌媛 ?놁뒿?덈떎.</span>
             </div>
             <div id="status-box" style="display:none; font-size:12px; color:var(--muted); line-height:1.6; padding:6px 4px; white-space:pre-wrap;"></div>
           </form>
@@ -1663,7 +1803,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
 
         <section class="sidebar-section sidebar-section-docs">
           <div class="sidebar-list-head">
-            <h3>문서 선택</h3>
+            <h3>臾몄꽌 ?좏깮</h3>
             <span class="sidebar-list-count" id="document-count-chip">0 docs</span>
           </div>
 
@@ -1673,13 +1813,13 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
           </div>
 
           <div class="select-all-row" id="select-all-row" style="display:none;">
-            <span class="select-all-text">전체 선택</span>
+            <span class="select-all-text">?꾩껜 ?좏깮</span>
             <span class="doc-check" id="select-all-check"></span>
-            <button id="delete-selected-button" type="button" style="margin-left:auto;padding:5px 14px;border:none;border-radius:999px;background:#dc2626;color:#fff;font:inherit;font-size:13px;font-weight:700;cursor:pointer;opacity:0.4;pointer-events:none;">삭제</button>
+            <button id="delete-selected-button" type="button" style="margin-left:auto;padding:5px 14px;border:none;border-radius:999px;background:#dc2626;color:#fff;font:inherit;font-size:13px;font-weight:700;cursor:pointer;opacity:0.4;pointer-events:none;">??젣</button>
           </div>
 
           <div class="doc-list sidebar-doc-list" id="document-list">
-            <div class="status-box">문서 목록을 불러오는 중입니다.</div>
+            <div class="status-box">臾몄꽌 紐⑸줉??遺덈윭?ㅻ뒗 以묒엯?덈떎.</div>
           </div>
         </section>
       </div>
@@ -1688,7 +1828,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     <main class="main">
       <div class="topbar">
         <div class="page-title">
-          <h1>문서 보기</h1>
+          <h1>臾몄꽌 蹂닿린</h1>
         </div>
       </div>
 
@@ -1699,30 +1839,30 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
           <section class="panel summary-box">
             <div class="summary-header">
               <div>
-                <h2>요약</h2>
+                <h2>?붿빟</h2>
               </div>
               <div class="toolbar">
-                <button class="ghost-button" id="download-md-button" type="button">다운로드 .md</button>
-                <button class="ghost-button" id="download-txt-button" type="button">다운로드 .txt</button>
-                <button class="summary-toggle" id="summary-toggle" type="button" title="접기 / 펼치기">▲</button>
+                <button class="ghost-button" id="download-md-button" type="button">?ㅼ슫濡쒕뱶 .md</button>
+                <button class="ghost-button" id="download-txt-button" type="button">?ㅼ슫濡쒕뱶 .txt</button>
+                <button class="summary-toggle" id="summary-toggle" type="button" title="?묎린 / ?쇱튂湲?>??/button>
               </div>
             </div>
             <div id="summary-content" style="margin-top:16px;">
-              <p class="summary-text" style="color: var(--muted);">문서를 선택하면 자동으로 요약을 불러옵니다.</p>
+              <p class="summary-text" style="color: var(--muted);">臾몄꽌瑜??좏깮?섎㈃ ?먮룞?쇰줈 ?붿빟??遺덈윭?듬땲??</p>
             </div>
           </section>
 
           <section class="panel qa-box">
-            <h2>질문</h2>
+            <h2>吏덈Ц</h2>
             <div class="chat-shell">
               <div class="chat-history" id="chat-history">
-                <div class="chat-empty">문서를 선택한 뒤 질문을 입력하세요.</div>
+                <div class="chat-empty">臾몄꽌瑜??좏깮????吏덈Ц???낅젰?섏꽭??</div>
               </div>
             </div>
             <form class="chat-composer" id="query-form">
-              <textarea class="question-area" id="query-input" placeholder="예: 이 문서의 핵심 조건을 세 줄로 정리해줘"></textarea>
+              <textarea class="question-area" id="query-input" placeholder="?? ??臾몄꽌???듭떖 議곌굔????以꾨줈 ?뺣━?댁쨾"></textarea>
               <div class="chat-toolbar">
-                <button class="pill-button" id="query-button" type="submit">질문하기</button>
+                <button class="pill-button" id="query-button" type="submit">吏덈Ц?섍린</button>
               </div>
             </form>
           </section>
@@ -1771,13 +1911,13 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     sidebarWorkspace.classList.add('active');
     workspaceScreen.classList.add('active');
 
-    // 소스 가이드 접기/펼치기 토글
+    // ?뚯뒪 媛?대뱶 ?묎린/?쇱튂湲??좉?
     summaryToggle.addEventListener('click', () => {{
       state.guideCollapsed = !state.guideCollapsed;
       summaryContent.classList.toggle('guide-collapsed', state.guideCollapsed);
       summaryContent.closest('.summary-box').classList.toggle('guide-collapsed', state.guideCollapsed);
-      summaryToggle.textContent = state.guideCollapsed ? '▼' : '▲';
-      // 접으면 현재 선택 문서의 체크 해제 (자유 선택 복귀)
+      summaryToggle.textContent = state.guideCollapsed ? '?? : '??;
+      // ?묒쑝硫??꾩옱 ?좏깮 臾몄꽌??泥댄겕 ?댁젣 (?먯쑀 ?좏깮 蹂듦?)
       if (state.guideCollapsed && state.selectedDocumentId) {{
         state.checkedDocumentIds = state.checkedDocumentIds.filter(id => id !== state.selectedDocumentId);
         renderDocumentList();
@@ -1804,11 +1944,11 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     function renderSelectedFiles(files, targetEl) {{
       if (!targetEl) return;
       if (!files.length) {{
-        targetEl.innerHTML = '<span class="file-chip">선택된 문서가 없습니다.</span>';
+        targetEl.innerHTML = '<span class="file-chip">?좏깮??臾몄꽌媛 ?놁뒿?덈떎.</span>';
         return;
       }}
       targetEl.innerHTML = files
-        .map((file) => `<span class="file-chip">${{esc(file.name)}} · ${{Math.max(1, Math.round(file.size / 1024))}}KB</span>`)
+        .map((file) => `<span class="file-chip">${{esc(file.name)}} 쨌 ${{Math.max(1, Math.round(file.size / 1024))}}KB</span>`)
         .join('');
     }}
 
@@ -1887,7 +2027,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       const allChecked = state.documents.every((doc) => state.checkedDocumentIds.includes(doc.document_id));
       if (allChecked) {{
         selectAllCheck.classList.add('checked');
-        selectAllCheck.textContent = '✓';
+        selectAllCheck.textContent = '??;
       }} else {{
         selectAllCheck.classList.remove('checked');
         selectAllCheck.textContent = '';
@@ -1901,8 +2041,8 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       event.stopPropagation();
       const ids = [...state.checkedDocumentIds];
       if (!ids.length) return;
-      if (!confirm(`선택한 문서 ${{ids.length}}개를 벡터 DB에서 삭제합니다. 계속하시겠습니까?`)) return;
-      deleteSelectedButton.textContent = '삭제 중...';
+      if (!confirm(`?좏깮??臾몄꽌 ${{ids.length}}媛쒕? 踰≫꽣 DB?먯꽌 ??젣?⑸땲?? 怨꾩냽?섏떆寃좎뒿?덇퉴?`)) return;
+      deleteSelectedButton.textContent = '??젣 以?..';
       deleteSelectedButton.style.pointerEvents = 'none';
       try {{
         const response = await fetch('/api/delete-documents', {{
@@ -1911,14 +2051,14 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
           body: JSON.stringify({{ document_ids: ids }})
         }});
         const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || '삭제에 실패했습니다.');
+        if (!response.ok) throw new Error(payload.error || '??젣???ㅽ뙣?덉뒿?덈떎.');
         state.checkedDocumentIds = [];
         state.selectedDocumentId = '';
         await loadDocuments();
       }} catch (error) {{
         alert(String(error));
       }} finally {{
-        deleteSelectedButton.textContent = '삭제';
+        deleteSelectedButton.textContent = '??젣';
         updateSelectAllCheckbox();
       }}
     }});
@@ -1938,7 +2078,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
 
     function renderDocumentList() {{
       if (!state.documents.length) {{
-        documentList.innerHTML = '<div class="status-box">표시할 문서가 없습니다.</div>';
+        documentList.innerHTML = '<div class="status-box">?쒖떆??臾몄꽌媛 ?놁뒿?덈떎.</div>';
         selectAllRow.style.display = 'none';
         renderCheckedSummary();
         return;
@@ -1953,7 +2093,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
           <span class="doc-copy">
             <strong>${{esc(doc.source_name || doc.document_id)}}</strong>
           </span>
-          <span class="doc-check${{checked ? ' checked' : ''}}" data-check-id="${{esc(doc.document_id)}}">${{checked ? '✓' : ''}}</span>
+          <span class="doc-check${{checked ? ' checked' : ''}}" data-check-id="${{esc(doc.document_id)}}">${{checked ? '?? : ''}}</span>
         </button>`;
       }}).join('');
 
@@ -1961,15 +2101,15 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
         button.addEventListener('click', () => {{
           const docId = button.getAttribute('data-id') || '';
           state.selectedDocumentId = docId;
-          // 소스 선택 시 항상 체크박스 선택
+          // ?뚯뒪 ?좏깮 ????긽 泥댄겕諛뺤뒪 ?좏깮
           if (docId && !isCheckedDocument(docId)) {{
             state.checkedDocumentIds = dedupeDocumentIds([...state.checkedDocumentIds, docId]);
           }}
-          // 소스 가이드 펼치기
+          // ?뚯뒪 媛?대뱶 ?쇱튂湲?
           if (state.guideCollapsed) {{
             state.guideCollapsed = false;
             summaryContent.classList.remove('guide-collapsed');
-            summaryToggle.textContent = '▲';
+            summaryToggle.textContent = '??;
           }}
           renderDocumentList();
           renderDocumentPlaceholder();
@@ -1993,7 +2133,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     function renderDocumentPlaceholder() {{
       const selected = getSelectedDocument();
       if (!selected) {{
-        summaryContent.innerHTML = '<p class="summary-text" style="color: var(--muted);">문서를 선택하면 요약을 확인할 수 있습니다.</p>';
+        summaryContent.innerHTML = '<p class="summary-text" style="color: var(--muted);">臾몄꽌瑜??좏깮?섎㈃ ?붿빟???뺤씤?????덉뒿?덈떎.</p>';
         return;
       }}
 
@@ -2009,7 +2149,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
           <span>${{esc(selected.document_type || selected.extension || 'document')}}</span>
           <span>${{esc(selected.origin || 'project')}}</span>
         </div>
-        <p class="summary-text" style="color:var(--muted);">요약을 불러오는 중입니다...</p>`;
+        <p class="summary-text" style="color:var(--muted);">?붿빟??遺덈윭?ㅻ뒗 以묒엯?덈떎...</p>`;
 
       autoSummarizeDocument(selected.document_id);
     }}
@@ -2027,7 +2167,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
           ${{
             keyPoints.length
               ? keyPoints.map((item) => `<div class="point">${{esc(item)}}</div>`).join('')
-              : '<div class="point">별도 핵심 포인트가 없습니다.</div>'
+              : '<div class="point">蹂꾨룄 ?듭떖 ?ъ씤?멸? ?놁뒿?덈떎.</div>'
           }}
         </div>`;
     }}
@@ -2074,6 +2214,55 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       const isError = Boolean(result.error);
       return `<div class="chat-answer-card">
         <div class="chat-answer-head">
+          <h3>QA 野껉퀗??/h3>
+          ${{result.used_model ? `<span class="answer-badge">${{esc(result.used_model)}}</span>` : ''}}
+        </div>
+        <p class="chat-answer-text">${{esc(result.answer || '???????곷뮸??덈뼄.')}}</p>
+        ${{
+          isError
+            ? `<div class="evidence-list"><div class="evidence-item">QA ?遺욧퍕 筌ｌ꼶??餓???살첒揶쎛 獄쏆뮇源??됰뮸??덈뼄. ${{
+                esc(String(result.error || 'unknown_error'))
+              }}</div></div>`
+            : ''
+        }}
+      </div>`;
+
+      const evidenceHtml = isError
+        ? `<div class="evidence-item">QA ?붿껌 泥섎━ 以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎. ${{
+            esc(String(result.error || 'unknown_error'))
+          }}</div>`
+        : citations.length
+        ? citations.map((c) =>
+            `<div class="evidence-item">
+              <strong>${{esc(c.source_name || 'document')}}</strong><br>
+              <span style="color:var(--muted);">${{esc(c.section_hint || 'section')}}</span>
+              <div style="margin-top:8px; white-space:pre-wrap;">${{esc(String(c.quote || '').replace(/<br\\s*\\/?>/gi, '\\n'))}}</div>
+            </div>`
+          ).join('')
+        : matches.slice(0, 3).map((m) => {{
+            const md = m.metadata || {{}};
+            const ex = m.document || m.page_content || '';
+            return `<div class="evidence-item">
+              <strong>${{esc(md.source_name || md.document_id || 'document')}}</strong><br>
+              <span style="color:var(--muted);">${{esc(md.section_hint || 'section')}}</span>
+              <div style="margin-top:8px; white-space:pre-wrap;">${{esc(String(ex).replace(/<br\\s*\\/?>/gi, '\\n'))}}</div>
+            </div>`;
+          }}).join('') || '<div class="evidence-item">洹쇨굅媛 ?놁뒿?덈떎.</div>';
+
+      return `<div class="chat-answer-card">
+        <div class="chat-answer-head">
+          <h3>QA 寃곌낵</h3>
+          ${{result.used_model ? `<span class="answer-badge">${{esc(result.used_model)}}</span>` : ''}}
+        </div>
+        <p class="chat-answer-text">${{esc(result.answer || '?듬????놁뒿?덈떎.')}}</p>
+        <div class="evidence-list">${{evidenceHtml}}</div>
+      </div>`;
+    }}
+
+    function renderAnswerBubble(result) {{
+      const isError = Boolean(result.error);
+      return `<div class="chat-answer-card">
+        <div class="chat-answer-head">
           <h3>QA 寃곌낵</h3>
           ${{result.used_model ? `<span class="answer-badge">${{esc(result.used_model)}}</span>` : ''}}
         </div>
@@ -2086,67 +2275,18 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
             : ''
         }}
       </div>`;
-
-      const evidenceHtml = isError
-        ? `<div class="evidence-item">QA 요청 처리 중 오류가 발생했습니다. ${{
-            esc(String(result.error || 'unknown_error'))
-          }}</div>`
-        : citations.length
-        ? citations.map((c) =>
-            `<div class="evidence-item">
-              <strong>${{esc(c.source_name || 'document')}}</strong><br>
-              <span style="color:var(--muted);">${{esc(c.section_hint || 'section')}}</span>
-              <div style="margin-top:8px;">${{esc(c.quote || '')}}</div>
-            </div>`
-          ).join('')
-        : matches.slice(0, 3).map((m) => {{
-            const md = m.metadata || {{}};
-            const ex = m.document || m.page_content || '';
-            return `<div class="evidence-item">
-              <strong>${{esc(md.source_name || md.document_id || 'document')}}</strong><br>
-              <span style="color:var(--muted);">${{esc(md.section_hint || 'section')}}</span>
-              <div style="margin-top:8px;">${{esc(String(ex).slice(0, 220))}}</div>
-            </div>`;
-          }}).join('') || '<div class="evidence-item">근거가 없습니다.</div>';
-
-      return `<div class="chat-answer-card">
-        <div class="chat-answer-head">
-          <h3>QA 결과</h3>
-          ${{result.used_model ? `<span class="answer-badge">${{esc(result.used_model)}}</span>` : ''}}
-        </div>
-        <p class="chat-answer-text">${{esc(result.answer || '답변이 없습니다.')}}</p>
-        <div class="evidence-list">${{evidenceHtml}}</div>
-      </div>`;
-    }}
-
-    function renderAnswerBubble(result) {{
-      const isError = Boolean(result.error);
-      return `<div class="chat-answer-card">
-        <div class="chat-answer-head">
-          <h3>QA 결과</h3>
-          ${{result.used_model ? `<span class="answer-badge">${{esc(result.used_model)}}</span>` : ''}}
-        </div>
-        <p class="chat-answer-text">${{esc(result.answer || '답변이 없습니다.')}}</p>
-        ${{
-          isError
-            ? `<div class="evidence-list"><div class="evidence-item">QA 요청 처리 중 오류가 발생했습니다. ${{
-                esc(String(result.error || 'unknown_error'))
-              }}</div></div>`
-            : ''
-        }}
-      </div>`;
     }}
 
     function renderChat(scrollToBottom = false) {{
       const history = state.chatHistory[state.selectedDocumentId] || [];
       if (!history.length) {{
-        chatHistoryEl.innerHTML = '<div class="chat-empty">문서를 선택한 뒤 질문을 입력하세요.</div>';
+        chatHistoryEl.innerHTML = '<div class="chat-empty">臾몄꽌瑜??좏깮????吏덈Ц???낅젰?섏꽭??</div>';
         return;
       }}
 
       const turns = history.map((entry) => {{
         const aiHtml = entry.loading
-          ? '<div class="chat-loading">답변을 찾는 중입니다...</div>'
+          ? '<div class="chat-loading">?듬???李얜뒗 以묒엯?덈떎...</div>'
           : renderAnswerBubble(entry.result || {{}});
 
         return `<div class="chat-turn">
@@ -2205,7 +2345,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       }}
 
       renderDocumentList();
-      // skipSummary=true일 때는 폴링 중 미완성 인덱스로 요약하지 않음
+      // skipSummary=true???뚮뒗 ?대쭅 以?誘몄셿???몃뜳?ㅻ줈 ?붿빟?섏? ?딆쓬
       if (!skipSummary) renderDocumentPlaceholder();
       renderCheckedSummary();
     }}
@@ -2223,15 +2363,15 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
         const dots = '.'.repeat((pollTick % 3) + 1);
 
         const progressText = progressTotal > 1
-          ? Math.min(progressCurrent, progressTotal) + ' / ' + progressTotal + '개 완료'
-          : (payload.status === 'running' ? ('처리 중' + dots) : '');
+          ? Math.min(progressCurrent, progressTotal) + ' / ' + progressTotal + '媛??꾨즺'
+          : (payload.status === 'running' ? ('泥섎━ 以? + dots) : '');
         setStatus([
           payload.message || '',
           progressText
         ].filter(Boolean));
 
-        // 진행 상황이 바뀌거나, 실행 중일 때 3틱마다 주기적으로 목록 갱신
-        // skipSummary:true — 인덱싱 완료 전에 빈 요약이 캐시에 저장되는 것을 방지
+        // 吏꾪뻾 ?곹솴??諛붾뚭굅?? ?ㅽ뻾 以묒씪 ??3?깅쭏??二쇨린?곸쑝濡?紐⑸줉 媛깆떊
+        // skipSummary:true ???몃뜳???꾨즺 ?꾩뿉 鍮??붿빟??罹먯떆????λ릺??寃껋쓣 諛⑹?
         const shouldRefresh = progressCurrent > lastCompletedCount || (payload.status === 'running' && pollTick % 3 === 0);
         if (shouldRefresh) {{
           lastCompletedCount = Math.max(lastCompletedCount, progressCurrent);
@@ -2248,7 +2388,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
               renderCheckedSummary();
             }}
           }} catch (_) {{
-            // 목록 갱신 실패 시 무시하고 폴링 계속
+            // 紐⑸줉 媛깆떊 ?ㅽ뙣 ??臾댁떆?섍퀬 ?대쭅 怨꾩냽
           }}
         }}
 
@@ -2262,31 +2402,31 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
           const vectorSummary = result.vector_index || {{}};
           const timings = result.timings || {{}};
 
-          // 파일 레벨 중복 (duplicate_uploads): existing_document_id 포함
+          // ?뚯씪 ?덈꺼 以묐났 (duplicate_uploads): existing_document_id ?ы븿
           const duplicateUploads = result.duplicate_uploads || [];
-          // 컨텐츠 레벨 중복 (content_duplicate_uploads): document_id 포함
+          // 而⑦뀗痢??덈꺼 以묐났 (content_duplicate_uploads): document_id ?ы븿
           const contentDuplicates = result.content_duplicate_uploads || [];
-          // 새로 indexed된 문서들
+          // ?덈줈 indexed??臾몄꽌??
           const indexedDocs = (vectorSummary.documents || []).filter((item) => item.status === 'indexed');
 
           const newCount = indexedDocs.length;
           const dupCount = duplicateUploads.length + contentDuplicates.length;
 
-          // 중복 문서의 기존 document_id 수집
+          // 以묐났 臾몄꽌??湲곗〈 document_id ?섏쭛
           const dupDocIds = [
             ...duplicateUploads.map((d) => d.existing_document_id).filter(Boolean),
             ...contentDuplicates.map((d) => d.document_id).filter(Boolean),
           ];
-          // 신규 문서 ID 수집
+          // ?좉퇋 臾몄꽌 ID ?섏쭛
           const newDocIds = indexedDocs.map((d) => d.document_id).filter(Boolean);
-          // 전체 배치 ID (중복 우선, 신규 추가, 중복 제거)
+          // ?꾩껜 諛곗튂 ID (以묐났 ?곗꽑, ?좉퇋 異붽?, 以묐났 ?쒓굅)
           const batchDocIds = [...new Set([...dupDocIds, ...newDocIds])];
-          // 자동 선택: 중복이 있으면 첫 중복, 없으면 첫 신규
+          // ?먮룞 ?좏깮: 以묐났???덉쑝硫?泥?以묐났, ?놁쑝硫?泥??좉퇋
           const preferredDocId = batchDocIds[0] || '';
 
           const statusLines = [
             'Run ID: ' + (result.run_id || ''),
-            '신규 문서: ' + newCount + '개  /  중복 문서: ' + dupCount + '개',
+            '?좉퇋 臾몄꽌: ' + newCount + '媛? /  以묐났 臾몄꽌: ' + dupCount + '媛?,
           ];
           if (typeof timings.qa_ready_seconds === 'number') statusLines.push('QA ready: ' + timings.qa_ready_seconds.toFixed(3) + 's');
           if (typeof timings.parse_seconds === 'number') statusLines.push('Parse: ' + timings.parse_seconds.toFixed(3) + 's');
@@ -2303,24 +2443,24 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
             if (filedupNames.length) {{
               const MAX_SHOW = 3;
               const shown = filedupNames.slice(0, MAX_SHOW).join(', ');
-              const rest = filedupNames.length > MAX_SHOW ? ` 외 ${{filedupNames.length - MAX_SHOW}}개` : '';
-              statusLines.push('파일 중복 (' + filedupNames.length + '개): ' + shown + rest);
+              const rest = filedupNames.length > MAX_SHOW ? ` ??${{filedupNames.length - MAX_SHOW}}媛? : '';
+              statusLines.push('?뚯씪 以묐났 (' + filedupNames.length + '媛?: ' + shown + rest);
             }}
             if (contentdupNames.length) {{
               const MAX_SHOW = 3;
               const shown = contentdupNames.slice(0, MAX_SHOW).join(', ');
-              const rest = contentdupNames.length > MAX_SHOW ? ` 외 ${{contentdupNames.length - MAX_SHOW}}개` : '';
-              statusLines.push('내용 중복 (' + contentdupNames.length + '개): ' + shown + rest);
+              const rest = contentdupNames.length > MAX_SHOW ? ` ??${{contentdupNames.length - MAX_SHOW}}媛? : '';
+              statusLines.push('?댁슜 以묐났 (' + contentdupNames.length + '媛?: ' + shown + rest);
             }}
           }}
           setStatus(statusLines);
 
           state.latestRun = result;
 
-          // 첫 번째 문서(중복 우선) 자동 선택
+          // 泥?踰덉㎏ 臾몄꽌(以묐났 ?곗꽑) ?먮룞 ?좏깮
           await loadDocuments(preferredDocId);
 
-          // 이번 배치에 포함된 모든 문서(신규+중복) 체크박스 선택
+          // ?대쾲 諛곗튂???ы븿??紐⑤뱺 臾몄꽌(?좉퇋+以묐났) 泥댄겕諛뺤뒪 ?좏깮
           if (batchDocIds.length) {{
             const availableIds = new Set(state.documents.map((d) => d.document_id));
             const validBatchIds = batchDocIds.filter((id) => availableIds.has(id));
@@ -2331,22 +2471,22 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
             }}
           }}
 
-          // 신규 문서 전체 요약: 폴링 중 빈 캐시가 저장됐을 수 있으므로
-          // newDocIds 캐시를 초기화한 뒤 재요약
+          // ?좉퇋 臾몄꽌 ?꾩껜 ?붿빟: ?대쭅 以?鍮?罹먯떆媛 ??λ릱?????덉쑝誘濡?
+          // newDocIds 罹먯떆瑜?珥덇린?뷀븳 ???ъ슂??
           newDocIds.forEach((id) => {{ delete state.summaryCache[id]; }});
           if (newDocIds.length > 0) {{
-            // 선택된 문서가 신규 목록에 있으면 먼저 처리
+            // ?좏깮??臾몄꽌媛 ?좉퇋 紐⑸줉???덉쑝硫?癒쇱? 泥섎━
             const selectedFirst = newDocIds.includes(state.selectedDocumentId)
               ? [state.selectedDocumentId, ...newDocIds.filter((id) => id !== state.selectedDocumentId)]
               : newDocIds;
-            // UI에 "요약 중..." 표시 후 즉시 요약 시작
+            // UI??"?붿빟 以?.." ?쒖떆 ??利됱떆 ?붿빟 ?쒖옉
             renderDocumentPlaceholder();
             await autoSummarizeDocument(selectedFirst[0]);
             for (const docId of selectedFirst.slice(1)) {{
               autoSummarizeDocument(docId); // fire-and-forget
             }}
           }} else {{
-            // 신규 문서 없음(중복만 있는 경우) — 선택 문서 요약은 renderDocumentPlaceholder가 처리
+            // ?좉퇋 臾몄꽌 ?놁쓬(以묐났留??덈뒗 寃쎌슦) ???좏깮 臾몄꽌 ?붿빟? renderDocumentPlaceholder媛 泥섎━
             renderDocumentPlaceholder();
           }}
 
@@ -2356,7 +2496,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
 
         if (payload.status === 'failed') {{
           resetUploadUiState();
-          setStatus(payload.error || payload.message || '작업이 실패했습니다.');
+          setStatus(payload.error || payload.message || '?묒뾽???ㅽ뙣?덉뒿?덈떎.');
           return;
         }}
 
@@ -2367,7 +2507,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     async function summarizeSelectedDocument() {{
       const selected = getSelectedDocument();
       if (!selected) {{
-        summaryContent.innerHTML = '<p class="summary-text" style="color: var(--muted);">먼저 문서를 선택하세요.</p>';
+        summaryContent.innerHTML = '<p class="summary-text" style="color: var(--muted);">癒쇱? 臾몄꽌瑜??좏깮?섏꽭??</p>';
         return;
       }}
 
@@ -2376,7 +2516,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       downloadTxtButton.disabled = true;
 
       if (state.selectedDocumentId === targetDocumentId) {{
-        summaryContent.innerHTML = '<p class="summary-text" style="color: var(--muted);">요약을 생성하는 중입니다...</p>';
+        summaryContent.innerHTML = '<p class="summary-text" style="color: var(--muted);">?붿빟???앹꽦?섎뒗 以묒엯?덈떎...</p>';
       }}
 
       try {{
@@ -2389,7 +2529,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
           }}),
         }});
         const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || '요약 생성에 실패했습니다.');
+        if (!response.ok) throw new Error(payload.error || '?붿빟 ?앹꽦???ㅽ뙣?덉뒿?덈떎.');
         renderSummary(payload, targetDocumentId);
       }} catch (error) {{
         if (state.selectedDocumentId === targetDocumentId) {{
@@ -2404,7 +2544,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     function downloadSummary(format) {{
       const selected = getSelectedDocument();
       if (!selected) {{
-        setStatus('먼저 다운로드할 문서를 선택해 주세요.');
+        setStatus('癒쇱? ?ㅼ슫濡쒕뱶??臾몄꽌瑜??좏깮??二쇱꽭??');
         return;
       }}
       window.location.href =
@@ -2413,13 +2553,13 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
 
     async function submitUploads(files, buttonEl) {{
       if (!files.length) {{
-        setStatus('업로드할 문서를 먼저 선택하세요.');
+        setStatus('?낅줈?쒗븷 臾몄꽌瑜?癒쇱? ?좏깮?섏꽭??');
         return;
       }}
 
       buttonEl.disabled = true;
       uploadSpinner.classList.add('active');
-      setStatus('업로드를 시작했습니다. 문서 처리 파이프라인을 준비하고 있습니다.');
+      setStatus('?낅줈?쒕? ?쒖옉?덉뒿?덈떎. 臾몄꽌 泥섎━ ?뚯씠?꾨씪?몄쓣 以鍮꾪븯怨??덉뒿?덈떎.');
 
       const formData = new FormData();
       files.forEach((file) => formData.append('documents', file, file.name));
@@ -2427,7 +2567,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       try {{
         const response = await fetch('/api/run', {{ method: 'POST', body: formData }});
         const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || '파이프라인 실행에 실패했습니다.');
+        if (!response.ok) throw new Error(payload.error || '?뚯씠?꾨씪???ㅽ뻾???ㅽ뙣?덉뒿?덈떎.');
         await pollJob(payload.job_id);
       }} catch (error) {{
         resetUploadUiState(buttonEl);
@@ -2446,7 +2586,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       await submitUploads(Array.from(workspaceFileInput.files || []), workspaceUploadButton);
     }});
 
-    // 드래그앤드롭 업로드
+    // ?쒕옒洹몄븻?쒕∼ ?낅줈??
     const uploadDropzone = document.getElementById('upload-dropzone');
 
     uploadDropzone.addEventListener('click', () => workspaceFileInput.click());
@@ -2454,7 +2594,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     uploadDropzone.addEventListener('dragenter', (event) => {{
       event.preventDefault();
       uploadDropzone.classList.add('drag-over');
-      uploadDropzone.querySelector('span:nth-child(2)').textContent = '여기에 놓으세요!';
+      uploadDropzone.querySelector('span:nth-child(2)').textContent = '?ш린???볦쑝?몄슂!';
     }});
 
     uploadDropzone.addEventListener('dragover', (event) => {{
@@ -2464,14 +2604,14 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     uploadDropzone.addEventListener('dragleave', (event) => {{
       if (!uploadDropzone.contains(event.relatedTarget)) {{
         uploadDropzone.classList.remove('drag-over');
-        uploadDropzone.querySelector('span:nth-child(2)').textContent = '파일을 여기에 드래그하여 업로드';
+        uploadDropzone.querySelector('span:nth-child(2)').textContent = '?뚯씪???ш린???쒕옒洹명븯???낅줈??;
       }}
     }});
 
     uploadDropzone.addEventListener('drop', (event) => {{
       event.preventDefault();
       uploadDropzone.classList.remove('drag-over');
-      uploadDropzone.querySelector('span:nth-child(2)').textContent = '파일을 여기에 드래그하여 업로드';
+      uploadDropzone.querySelector('span:nth-child(2)').textContent = '?뚯씪???ш린???쒕옒洹명븯???낅줈??;
       const files = Array.from(event.dataTransfer.files || []);
       if (files.length) {{
         renderSelectedFiles(files, workspaceSelectedFiles);
@@ -2479,7 +2619,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       }}
     }});
 
-    // 페이지 전체에서 실수로 파일을 드롭하는 것 방지
+    // ?섏씠吏 ?꾩껜?먯꽌 ?ㅼ닔濡??뚯씪???쒕∼?섎뒗 寃?諛⑹?
     document.addEventListener('dragover', (event) => event.preventDefault());
     document.addEventListener('drop', (event) => event.preventDefault());
 
@@ -2501,12 +2641,12 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       const scopedDocumentIds = getScopedDocumentIds();
 
       if (!selected) {{
-        chatHistoryEl.innerHTML = '<div class="chat-empty">먼저 문서를 선택하세요.</div>';
+        chatHistoryEl.innerHTML = '<div class="chat-empty">癒쇱? 臾몄꽌瑜??좏깮?섏꽭??</div>';
         return;
       }}
 
       if (!scopedDocumentIds.length) {{
-        chatHistoryEl.innerHTML = '<div class="chat-empty">검색할 문서를 체크하세요.</div>';
+        chatHistoryEl.innerHTML = '<div class="chat-empty">寃?됲븷 臾몄꽌瑜?泥댄겕?섏꽭??</div>';
         return;
       }}
 
@@ -2527,8 +2667,8 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
       renderChat(true);
 
       try {{
-        // 여러 문서가 선택된 경우 document_id를 비워서 백엔드 source_boost가
-        // 활성 문서 하나에만 집중되지 않도록 함
+        // ?щ윭 臾몄꽌媛 ?좏깮??寃쎌슦 document_id瑜?鍮꾩썙??諛깆뿏??source_boost媛
+        // ?쒖꽦 臾몄꽌 ?섎굹?먮쭔 吏묒쨷?섏? ?딅룄濡???
         const response = await fetch('/api/query', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
@@ -2542,7 +2682,7 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
         }});
 
         const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || '질의응답에 실패했습니다.');
+        if (!response.ok) throw new Error(payload.error || '吏덉쓽?묐떟???ㅽ뙣?덉뒿?덈떎.');
         entry.result = payload || {{}};
         entry.loading = false;
       }} catch (error) {{
@@ -2559,10 +2699,10 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     loadDocuments()
       .then(() => renderChat())
       .catch(() => {{
-        documentList.innerHTML = '<div class="status-box">문서 목록을 불러오지 못했습니다.</div>';
+        documentList.innerHTML = '<div class="status-box">臾몄꽌 紐⑸줉??遺덈윭?ㅼ? 紐삵뻽?듬땲??</div>';
       }});
 
-    // 벡터 DB 인덱싱 완료 시 서버 이벤트로 문서 목록 자동 갱신
+    // 踰≫꽣 DB ?몃뜳???꾨즺 ???쒕쾭 ?대깽?몃줈 臾몄꽌 紐⑸줉 ?먮룞 媛깆떊
     const evtSource = new EventSource('/api/events');
     evtSource.addEventListener('documents_updated', async () => {{
       const prevIds = new Set(state.documents.map((d) => d.document_id));
@@ -2732,7 +2872,8 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(error)}, status=400)
             return
         except Exception as error:
-            self._send_json({"error": str(error)}, status=500)
+            import traceback
+            self._send_json({"error": str(error), "traceback": traceback.format_exc()}, status=500)
             return
         self._send_json({"deleted": results}, status=200)
 
@@ -2766,7 +2907,8 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(error)}, status=400)
             return
         except Exception as error:
-            self._send_json({"error": str(error)}, status=500)
+            import traceback
+            self._send_json({"error": str(error), "traceback": traceback.format_exc()}, status=500)
             return
         self._send_json(job, status=202)
 
@@ -2976,6 +3118,7 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
         llm_summary = payload.get("llm_summary") if isinstance(payload.get("llm_summary"), dict) else {}
         ui_summary = payload.get("ui_summary") if isinstance(payload.get("ui_summary"), dict) else {}
         preferred_summary = ui_summary or llm_summary or basic_summary or {}
+        viewer_markdown = enrich_pdf_markdown_for_viewer(payload, str(payload.get("markdown") or ""))
         sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
         normalized_sections = []
         for item in sections[:8]:
@@ -2984,6 +3127,29 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             title = str(item.get("title") or "").strip()
             if title:
                 normalized_sections.append(title)
+        semantic_chunks = payload.get("semantic_chunks") if isinstance(payload.get("semantic_chunks"), list) else []
+        normalized_chunks: list[dict[str, object]] = []
+        for index, chunk in enumerate(semantic_chunks):
+            if not isinstance(chunk, dict):
+                continue
+            chunk_text = clean_viewer_markdown(str(chunk.get("text") or ""))
+            if not chunk_text.strip():
+                continue
+            raw_chunk_index = chunk.get("chunk_index")
+            try:
+                chunk_index = int(raw_chunk_index if raw_chunk_index is not None else index)
+            except (TypeError, ValueError):
+                chunk_index = index
+            normalized_chunks.append(
+                {
+                    "chunk_index": chunk_index,
+                    "text": chunk_text,
+                    "section_hint": str(chunk.get("section_hint") or ""),
+                    "strategy": str(chunk.get("strategy") or "semantic"),
+                    "char_count": int(chunk.get("char_count", len(chunk_text)) or len(chunk_text)),
+                }
+            )
+        normalized_chunks = _infer_semantic_chunk_page_numbers(payload, normalized_chunks)
         key_points = preferred_summary.get("key_points") or preferred_summary.get("highlights") or []
         return {
             "document_id": payload.get("document_id", ""),
@@ -2993,7 +3159,8 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             "summary_text": preferred_summary.get("summary_text", ""),
             "key_points": [str(item).strip() for item in key_points if str(item).strip()][:6],
             "section_titles": normalized_sections,
-            "markdown": str(payload.get("markdown") or ""),
+            "markdown": clean_viewer_markdown(viewer_markdown),
+            "semantic_chunks": normalized_chunks,
             "original_url": "/api/document-original?document_id={document_id}&source_name={source_name}".format(
                 document_id=quote(str(payload.get("document_id", ""))),
                 source_name=quote(str(payload.get("source_name", ""))),
@@ -3009,7 +3176,7 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
         key_points: list[str],
     ) -> str:
         lines = [
-            f"# {source_label} 요약",
+            f"# {source_label} ?붿빟",
             "",
             f"- Document ID: {result.get('document_id', '')}",
             f"- Document Type: {result.get('document_type', '')}",
@@ -3036,21 +3203,21 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
         key_points: list[str],
     ) -> str:
         lines = [
-            f"{source_label} 요약",
+            f"{source_label} ?붿빟",
             "=" * max(8, len(source_label) + 3),
             f"Document ID: {result.get('document_id', '')}",
             f"Document Type: {result.get('document_type', '')}",
             f"Model: {result.get('used_model', '')}",
             "",
-            "[요약]",
-            summary_text or "(요약 없음)",
+            "[?붿빟]",
+            summary_text or "(?붿빟 ?놁쓬)",
             "",
-            "[핵심 포인트]",
+            "[?듭떖 ?ъ씤??",
         ]
         if key_points:
             lines.extend([f"- {item}" for item in key_points])
         else:
-            lines.append("- 핵심 포인트 없음")
+            lines.append("- ?듭떖 ?ъ씤???놁쓬")
         return "\n".join(lines) + "\n"
 
     def _make_download_filename(self, source_label: str, output_format: str) -> str:
@@ -3075,35 +3242,23 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             if not query:
                 self._send_json({"error": "query_is_required"}, status=400)
                 return
-            def _run_answer(selected_strategy: str, *, use_reranker: bool = True, force_local: bool = False) -> dict[str, object]:
-                if self.langchain_service is not None and not force_local:
-                    self._prime_query_summaries(
-                        document_id=document_id,
-                        source_name=source_name,
-                        selected_document_ids=selected_document_ids,
-                    )
-                    return self.langchain_service.answer_question(
-                        query=query,
-                        strategy=selected_strategy,
-                        document_id=document_id,
-                        source_name=source_name,
-                        document_ids=selected_document_ids,
-                        use_reranker=use_reranker,
-                    )
-                return self.retriever.answer_question(
+            request_retriever = ChromaRetriever(project_root=ROOT)
+            try:
+                answer = request_retriever.answer_question(
                     query=query,
-                    strategy=selected_strategy,
+                    strategy=strategy,
                     document_id=document_id,
                     source_name=source_name,
                     document_ids=selected_document_ids,
                 )
-
-            answer = _run_answer(strategy)
+            finally:
+                request_retriever.close()
         except ValueError as error:
             self._send_json({"error": str(error)}, status=400)
             return
         except Exception as error:
-            self._send_json({"error": str(error)}, status=500)
+            import traceback
+            self._send_json({"error": str(error), "traceback": traceback.format_exc()}, status=500)
             return
         self._send_json(answer, status=200)
 
@@ -3128,7 +3283,7 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
                 )
             except Exception as error:
                 custom_answer = {
-                    "answer": "Custom QA 답변 생성에 실패했습니다.",
+                    "answer": "Custom QA ?듬? ?앹꽦???ㅽ뙣?덉뒿?덈떎.",
                     "citations": [],
                     "matches": [],
                     "used_model": None,
@@ -3136,14 +3291,14 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
                 }
             if self.langchain_service is None:
                 langchain_answer = {
-                    "answer": "OPENAI_API_KEY가 없어 LangChain 서비스를 사용할 수 없습니다.",
+                    "answer": "OPENAI_API_KEY媛 ?놁뼱 LangChain ?쒕퉬?ㅻ? ?ъ슜?????놁뒿?덈떎.",
                     "citations": [],
                     "source_documents": [],
                     "used_model": None,
                     "warning": "langchain_service_unavailable",
                 }
                 langchain_reranked_answer = {
-                    "answer": "OPENAI_API_KEY가 없어 LangChain + reranker 서비스를 사용할 수 없습니다.",
+                    "answer": "OPENAI_API_KEY媛 ?놁뼱 LangChain + reranker ?쒕퉬?ㅻ? ?ъ슜?????놁뒿?덈떎.",
                     "citations": [],
                     "source_documents": [],
                     "used_model": None,
@@ -3169,14 +3324,14 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
                     )
                 except Exception as error:
                     langchain_answer = {
-                        "answer": "LangChain RetrievalQA 답변 생성에 실패했습니다.",
+                        "answer": "LangChain RetrievalQA ?듬? ?앹꽦???ㅽ뙣?덉뒿?덈떎.",
                         "citations": [],
                         "source_documents": [],
                         "used_model": None,
                         "warning": str(error),
                     }
                     langchain_reranked_answer = {
-                        "answer": "LangChain RetrievalQA + reranker 답변 생성에 실패했습니다.",
+                        "answer": "LangChain RetrievalQA + reranker ?듬? ?앹꽦???ㅽ뙣?덉뒿?덈떎.",
                         "citations": [],
                         "source_documents": [],
                         "used_model": None,
@@ -3330,6 +3485,7 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
 
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
+    clear_process_proxy_env()
     args = parse_args()
     manager = ReviewSessionManager(project_root=ROOT)
     retriever = ChromaRetriever(project_root=ROOT)
@@ -3362,3 +3518,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

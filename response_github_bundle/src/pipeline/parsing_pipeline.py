@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +27,12 @@ from src.shared.io import ensure_directory, iso_now, make_artifact_stem, write_j
 from src.shared.versioning import load_version_info
 from src.ui.pdf_overlay_report import PdfOverlaySiteBuilder
 from src.ui.parsing_review_report import ParsingReviewSiteBuilder
+
+INTERNAL_MARKER_LINE_PATTERNS = (
+    re.compile(r"\[financial fact table\]", re.IGNORECASE),
+    re.compile(r"\[row_path\]", re.IGNORECASE),
+)
+UNIT_LINE_PATTERN = re.compile(r"^\(Unit:\s*.*\)$", re.IGNORECASE)
 
 
 @dataclass
@@ -59,6 +66,23 @@ class ParsingPipeline:
             "txt": TextParser(),
             "conversion_fallback": ConversionFallbackParser(),
         }
+
+    def _sanitize_markdown_for_chunking(self, markdown: str) -> str:
+        cleaned_lines: list[str] = []
+        skip_unit_line = False
+
+        for line in str(markdown or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            stripped = line.strip()
+            if any(pattern.search(stripped) for pattern in INTERNAL_MARKER_LINE_PATTERNS):
+                skip_unit_line = True
+                continue
+            if skip_unit_line and UNIT_LINE_PATTERN.match(stripped):
+                skip_unit_line = False
+                continue
+            skip_unit_line = False
+            cleaned_lines.append(line)
+
+        return "\n".join(cleaned_lines).strip()
 
     def _process_document(self, path: Path, parsers: dict[str, Any]) -> dict[str, Any]:
         """단일 문서를 분류 → 파싱 → 요약 → 청킹 → 저장 → 콜백 순서로 처리한다."""
@@ -106,7 +130,10 @@ class ParsingPipeline:
         payload = ensure_basic_summary(parsed_document_to_dict(parsed_document))
         basic_summary_seconds = round(time.perf_counter() - basic_summary_started_perf, 3)
 
-        markdown = str(payload.get("markdown") or "")
+        markdown = self._sanitize_markdown_for_chunking(str(payload.get("markdown") or ""))
+        payload["markdown"] = markdown
+        if payload.get("semantic_chunks"):
+            payload["semantic_chunks"] = []
         semantic_chunk_seconds = 0.0
         if markdown.strip() and not payload.get("semantic_chunks"):
             semantic_chunk_started_perf = time.perf_counter()
@@ -130,7 +157,7 @@ class ParsingPipeline:
 
             write_json(structured_path, payload)
             write_json(output_json_path, payload)
-            write_text(output_markdown_path, parsed_document.markdown.rstrip() + "\n")
+            write_text(output_markdown_path, markdown.rstrip() + "\n")
 
             record["structured_path"] = structured_path.as_posix()
             record["markdown_path"] = output_markdown_path.as_posix()

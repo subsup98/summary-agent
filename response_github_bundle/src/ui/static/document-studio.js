@@ -1,4 +1,4 @@
-(function () {
+﻿(function () {
   const config = window.__DOCUMENT_STUDIO__ || {};
   const initialStatus = config.initialStatus || {};
   const defaultQaStrategy = config.initialStatus?.semantic_ready
@@ -9,7 +9,8 @@
     documents: [],
     selectedDocumentId: "",
     checkedDocumentIds: [],
-    chatHistory: {},
+    starterDocumentId: "",
+    chatHistory: [],
     summaryCache: {},
     summaryInflight: {},
     sourceContentCache: {},
@@ -17,9 +18,9 @@
     sourceSummaryCollapsed: false,
     summaryCollapsed: false,
     modalOpen: false,
-    uploadPending: false,
-    pendingFilenames: [],
+    uploadJobs: {},
     uploadNotice: null,
+    sourceHighlight: null,
   };
 
   const body = document.body;
@@ -105,10 +106,69 @@
     return state.selectedDocumentId ? [state.selectedDocumentId] : [];
   }
 
-  function setUploadPending(pending) {
-    state.uploadPending = pending;
-    workspacePickButton.disabled = pending;
-    uploadSpinner.classList.toggle("active", pending);
+  function getActiveChatHistory() {
+    return state.chatHistory;
+  }
+
+  function getSummaryPayload(documentId) {
+    if (!documentId) return null;
+    const selected = state.documents.find((item) => item.document_id === documentId);
+    if (!selected) return null;
+
+    const cached = state.summaryCache[documentId];
+    if (cached) return cached;
+
+    const summary = selected.ui_summary || selected.llm_summary || selected.basic_summary || null;
+    if (!summary) return null;
+
+    return {
+      document_id: selected.document_id,
+      source_name: selected.source_name,
+      document_type: selected.document_type || selected.extension || "document",
+      summary_text: summary.summary_text || "",
+      key_points: summary.key_points || summary.highlights || [],
+      summary_source: summary.summary_source || "basic_summary",
+    };
+  }
+
+  function buildStarterSummaryHtml() {
+    const selected = state.documents.find((item) => item.document_id === state.starterDocumentId) || getSelectedDocument();
+    if (!selected) return "";
+
+    const payload = getSummaryPayload(selected.document_id);
+    const title = selected.source_name || selected.document_id || "문서";
+    const summaryText = payload?.summary_text || "문서 요약을 불러오는 중입니다.";
+
+    return `
+      <section class="chat-starter-card chat-empty-state">
+        <div class="chat-empty-summary">
+          <h3 class="chat-empty-summary-title">${esc(title)}</h3>
+          <p class="chat-empty-summary-text">${esc(summaryText)}</p>
+        </div>
+      </section>
+    `;
+  }
+
+  function getPendingFilenames() {
+    return Object.values(state.uploadJobs)
+      .flatMap((job) => job.filenames || [])
+      .filter(Boolean);
+  }
+
+  function refreshUploadUiState() {
+    uploadSpinner.classList.toggle("active", Object.keys(state.uploadJobs).length > 0);
+    renderDocumentList();
+  }
+
+  function addUploadJob(jobId, filenames) {
+    state.uploadJobs[jobId] = { filenames: [...new Set(filenames.filter(Boolean))] };
+    refreshUploadUiState();
+  }
+
+  function removeUploadJob(jobId) {
+    if (!jobId || !state.uploadJobs[jobId]) return;
+    delete state.uploadJobs[jobId];
+    refreshUploadUiState();
   }
 
   function renderSelectedFiles(files) {
@@ -135,7 +195,6 @@
   }
 
   function resetUploadUiState() {
-    setUploadPending(false);
     workspaceFileInput.value = "";
     renderSelectedFiles([]);
   }
@@ -153,48 +212,16 @@
     deleteSelectedButton.disabled = state.checkedDocumentIds.length === 0;
   }
 
-  function renderSummaryHtml(payload) {
-    const sourceLabel = payload.source_name || payload.document_id || "document";
-    const keyPoints = payload.key_points || [];
-    const isFallback = payload.summary_source === "basic_summary_fallback";
-    const fallbackBadge = isFallback
-      ? `<span class="summary-fallback-badge" title="OpenAI 미연결 — 기본 요약 사용 중">⚠️ 기본 요약</span>`
-      : "";
-    summaryContent.innerHTML = `
-      <div class="summary-banner-kicker">${esc(sourceLabel)}${fallbackBadge}</div>
-      <p class="summary-banner-text">${esc(payload.summary_text || "요약이 아직 준비되지 않았습니다.")}</p>
-      ${
-        keyPoints.length
-          ? `<div class="tag-row">${keyPoints.slice(0, 4).map((item) => `<span class="tag">${esc(item)}</span>`).join("")}</div>`
-          : ""
-      }
-    `;
-  }
-
-  function renderDocumentPlaceholder() {
+function renderDocumentPlaceholder() {
+    summaryContent.innerHTML = '';
+    summaryContent.hidden = true;
     const selected = getSelectedDocument();
-    if (!selected) {
-      summaryContent.innerHTML = '<div class="summary-banner-kicker">선택한 문서 안내</div><p class="summary-banner-text muted">문서를 선택하면 요약이 여기에 표시됩니다.</p>';
-      return;
-    }
+    if (!selected) return;
 
     const cached = state.summaryCache[selected.document_id];
-    if (cached && cached.summary_source !== "basic_summary_fallback") {
-      renderSummaryHtml(cached);
-      return;
-    }
-
-    if (cached && cached.summary_source === "basic_summary_fallback") {
-      renderSummaryHtml(cached);
+    if (!cached || cached.summary_source === "basic_summary_fallback") {
       void autoSummarizeDocument(selected.document_id);
-      return;
     }
-
-    summaryContent.innerHTML = `
-      <div class="summary-banner-kicker">${esc(selected.source_name || selected.document_id)}</div>
-      <p class="summary-banner-text muted">요약을 불러오는 중입니다...</p>
-    `;
-    void autoSummarizeDocument(selected.document_id);
   }
 
   async function autoSummarizeDocument(documentId, options = {}) {
@@ -219,7 +246,7 @@
       if (response.ok) {
         state.summaryCache[documentId] = payload;
         if (state.selectedDocumentId === documentId) {
-          renderSummaryHtml(payload);
+          renderChat();
         }
         if (state.sourceViewerDocumentId === documentId) {
           renderSourceViewer();
@@ -230,14 +257,28 @@
     }
   }
 
-  function formatMarkdownForViewer(markdown) {
+  function escapeRegExp(value) {
+    return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function applyHighlightHtml(html, highlightText) {
+    const needle = String(highlightText || "").trim();
+    if (!needle) return html;
+    const escapedNeedle = escapeRegExp(needle);
+    const regex = new RegExp(escapedNeedle, "i");
+    if (!regex.test(html)) return html;
+    return html.replace(regex, (match) => `<mark class="source-highlight">${match}</mark>`);
+  }
+
+  function formatMarkdownForViewer(markdown, highlightText = "") {
     if (!markdown) {
       return '<div class="muted">파싱 결과가 없습니다.</div>';
     }
-    return esc(markdown)
+    const html = esc(markdown)
       .split(/\n{2,}/)
       .map((block) => `<p>${block.replace(/\n/g, "<br>")}</p>`)
       .join("");
+    return applyHighlightHtml(html, highlightText);
   }
 
   function renderOriginalPreview(content) {
@@ -245,7 +286,9 @@
     if (!originalUrl) {
       return '<div class="source-original-fallback">문서 원본을 불러올 수 없습니다.</div>';
     }
-    return `<iframe class="source-original-embed" src="${esc(originalUrl)}#toolbar=0&navpanes=0"></iframe>`;
+    const pageNumber = state.sourceHighlight?.page_number;
+    const pageHash = pageNumber ? `#page=${pageNumber}&toolbar=0&navpanes=0` : "#toolbar=0&navpanes=0";
+    return `<iframe class="source-original-embed" src="${esc(originalUrl)}${pageHash}"></iframe>`;
   }
 
   function renderSourceViewer() {
@@ -271,7 +314,11 @@
     sourceDetailTitle.textContent = selected.source_name || selected.document_id || "문서";
     sourceDetailName.textContent = selected.source_name || selected.document_id || "문서";
     sourceDetailSummary.textContent = summary.summary_text || content.summary_text || "요약이 아직 준비되지 않았습니다.";
-    sourceDetailMeta.textContent = [content.document_type || selected.document_type, selected.origin].filter(Boolean).join(" · ");
+    sourceDetailMeta.textContent = [
+      content.document_type || selected.document_type,
+      selected.origin,
+      state.sourceHighlight?.page_number ? `p.${state.sourceHighlight.page_number}` : "",
+    ].filter(Boolean).join(" · ");
     sourceSummaryCard.classList.toggle("collapsed", state.sourceSummaryCollapsed);
     sourceSummaryToggle.setAttribute("aria-expanded", String(!state.sourceSummaryCollapsed));
 
@@ -282,7 +329,14 @@
     }
 
     sourceDetailOriginal.innerHTML = renderOriginalPreview(content);
-    sourceDetailContent.innerHTML = formatMarkdownForViewer(content.markdown || "");
+    sourceDetailContent.innerHTML = formatMarkdownForViewer(
+      content.markdown || "",
+      state.sourceHighlight?.highlight_text || "",
+    );
+    const marker = sourceDetailContent.querySelector(".source-highlight");
+    if (marker) {
+      marker.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
   }
 
   function collapseSummary() {
@@ -333,8 +387,30 @@
 
   function closeSourceViewer() {
     state.sourceViewerDocumentId = "";
+    state.sourceHighlight = null;
     renderSourceViewer();
     renderDocumentList();
+  }
+
+  async function focusCitation(citation) {
+    const documentId = citation.document_id || state.selectedDocumentId;
+    if (!documentId) return;
+    state.sourceHighlight = {
+      page_number: citation.page_number || null,
+      highlight_text: citation.highlight_text || citation.quote || "",
+    };
+    await openSourceViewer(documentId);
+  }
+
+  function renderAnswerTextWithInlineCitations(result) {
+    const citationMap = new Map((result.citations || []).map((citation) => [String(citation.source_number), citation]));
+    const html = renderMarkdown(result.answer || "응답이 없습니다.");
+    return html.replace(/\[(\d+)\]/g, (full, number) => {
+      const citation = citationMap.get(String(number));
+      if (!citation) return full;
+      const title = `${citation.source_name || "문서"}${citation.page_number ? ` · p.${citation.page_number}` : ""}`;
+      return `<button class="inline-citation-link" type="button" data-inline-citation-document-id="${esc(citation.document_id || "")}" data-inline-citation-page="${esc(citation.page_number ?? "")}" data-inline-citation-highlight="${esc(citation.highlight_text || citation.quote || "")}" title="${esc(title)}">[${esc(number)}]</button>`;
+    });
   }
 
   function renderUploadNotice() {
@@ -358,7 +434,7 @@
 
   function renderDocumentList() {
     const existingNames = new Set(state.documents.map((d) => d.source_name));
-    const pendingHtml = state.pendingFilenames
+    const pendingHtml = [...new Set(getPendingFilenames())]
       .filter((name) => !existingNames.has(name))
       .map((name) => {
         const ext = (name.split(".").pop() || "DOC").toUpperCase().slice(0, 5);
@@ -380,7 +456,8 @@
       return;
     }
 
-    const isPending = (doc) => state.pendingFilenames.includes(doc.source_name);
+    const pendingNameSet = new Set(getPendingFilenames());
+    const isPending = (doc) => pendingNameSet.has(doc.source_name);
 
     documentList.innerHTML = pendingHtml + state.documents.map((doc) => {
       const activeClass = doc.document_id === state.selectedDocumentId ? " active" : "";
@@ -431,25 +508,42 @@
     const isError = Boolean(result.error);
     const citations = result.citations || [];
     const matches = result.matches || result.source_documents || [];
+    
+    function buildCitationMeta(item) {
+      const parts = [];
+      if (item.source_name) parts.push(item.source_name);
+      if (item.page_number !== null && item.page_number !== undefined && item.page_number !== "") {
+        parts.push(`p.${item.page_number}`);
+      }
+      return parts.join(" · ");
+    }
 
     const evidenceHtml = isError
       ? `<div class="evidence-item">질문 처리 중 오류가 발생했습니다. ${esc(String(result.error || "unknown_error"))}</div>`
       : citations.length
-        ? citations.map((citation) => `
-            <div class="evidence-item">
-              <strong>${esc(citation.source_name || "document")}</strong>
-              <div class="muted">${esc(citation.section_hint || "section")}</div>
-              <div>${esc(citation.quote || "")}</div>
-            </div>
-          `).join("")
+        ? citations.map((citation) => {
+            const meta = buildCitationMeta(citation);
+            return `
+            <button
+              class="answer-evidence-card"
+              type="button"
+              data-citation-document-id="${esc(citation.document_id || "")}"
+              data-citation-page="${esc(citation.page_number ?? "")}"
+              data-citation-highlight="${esc(citation.highlight_text || citation.quote || "")}"
+            >
+              <div class="answer-evidence-card-head">
+                <span class="answer-evidence-card-number">[${esc(citation.source_number || "")}]</span>
+                <span class="answer-evidence-card-meta">${esc(meta || "문서 위치")}</span>
+              </div>
+            </button>
+          `;
+          }).join("")
         : matches.slice(0, 3).map((match) => {
             const metadata = match.metadata || {};
-            const excerpt = match.document || match.page_content || "";
+            const meta = buildCitationMeta(metadata);
             return `
               <div class="evidence-item">
-                <strong>${esc(metadata.source_name || metadata.document_id || "document")}</strong>
-                <div class="muted">${esc(metadata.section_hint || "section")}</div>
-                <div>${esc(String(excerpt).slice(0, 220))}</div>
+                <strong>${esc(meta || metadata.source_name || metadata.document_id || "document")}</strong>
               </div>
             `;
           }).join("") || '<div class="evidence-item">근거가 없습니다.</div>';
@@ -458,22 +552,22 @@
       <div class="chat-answer-card">
         <div class="chat-answer-head">
           <h3>답변</h3>
-          ${result.used_model ? `<span class="answer-badge">${esc(result.used_model)}</span>` : ""}
         </div>
-        <div class="chat-answer-text markdown-body">${renderMarkdown(result.answer || "응답이 없습니다.")}</div>
-        <div class="evidence-list">${evidenceHtml}</div>
+        <div class="chat-answer-text markdown-body">${renderAnswerTextWithInlineCitations(result)}</div>
+        ${isError ? `<div class="evidence-list">${evidenceHtml}</div>` : ""}
       </div>
     `;
   }
 
   function renderChat(scrollToBottom = false) {
-    const history = state.chatHistory[state.selectedDocumentId] || [];
+    const history = getActiveChatHistory();
+    const starterHtml = buildStarterSummaryHtml();
     if (!history.length) {
-      chatHistoryEl.innerHTML = '';
+      chatHistoryEl.innerHTML = starterHtml;
       return;
     }
 
-    chatHistoryEl.innerHTML = history.map((entry) => {
+    chatHistoryEl.innerHTML = starterHtml + history.map((entry) => {
       const aiHtml = entry.loading
         ? '<div class="chat-loading">답변을 생성하는 중입니다...</div>'
         : renderAnswerBubble(entry.result || {});
@@ -485,6 +579,25 @@
         </div>
       `;
     }).join("");
+
+    chatHistoryEl.querySelectorAll("[data-citation-document-id]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        await focusCitation({
+          document_id: button.getAttribute("data-citation-document-id") || "",
+          page_number: button.getAttribute("data-citation-page") || "",
+          highlight_text: button.getAttribute("data-citation-highlight") || "",
+        });
+      });
+    });
+    chatHistoryEl.querySelectorAll("[data-inline-citation-document-id]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        await focusCitation({
+          document_id: button.getAttribute("data-inline-citation-document-id") || "",
+          page_number: button.getAttribute("data-inline-citation-page") || "",
+          highlight_text: button.getAttribute("data-inline-citation-highlight") || "",
+        });
+      });
+    });
 
     if (scrollToBottom) {
       requestAnimationFrame(() => {
@@ -514,8 +627,10 @@
 
     if (!state.documents.length) {
       state.selectedDocumentId = "";
+      state.starterDocumentId = "";
       state.checkedDocumentIds = [];
       state.sourceViewerDocumentId = "";
+      state.chatHistory = [];
       renderSourceViewer();
       renderDocumentList();
       renderDocumentPlaceholder();
@@ -527,6 +642,9 @@
       state.selectedDocumentId = preferredDocumentId;
     } else if (!state.selectedDocumentId || !state.documents.some((item) => item.document_id === state.selectedDocumentId)) {
       state.selectedDocumentId = state.documents[0].document_id;
+    }
+    if (!state.starterDocumentId || !state.documents.some((item) => item.document_id === state.starterDocumentId)) {
+      state.starterDocumentId = state.selectedDocumentId;
     }
 
     const availableIds = new Set(state.documents.map((item) => item.document_id));
@@ -543,6 +661,7 @@
     if (!skipSummary) {
       renderDocumentPlaceholder();
     }
+    renderChat();
   }
 
   async function pollJob(jobId) {
@@ -551,7 +670,7 @@
       const payload = await response.json();
 
       if (payload.status === "completed") {
-        resetUploadUiState();
+        removeUploadJob(jobId);
         const result = payload.result || {};
         const vectorSummary = result.vector_index || {};
         const duplicateUploads = result.duplicate_uploads || [];
@@ -567,24 +686,29 @@
           ...duplicateUploads.map((item) => item.original_name || item.stored_name || ""),
           ...contentDuplicates.map((item) => item.source_name || ""),
         ].filter(Boolean);
+        const processingNames = duplicateUploads
+          .filter((item) => item.reason === "already_processing")
+          .map((item) => item.original_name || item.stored_name || "")
+          .filter(Boolean);
         state.uploadNotice = dupeNames.length
           ? {
               isDuplicate: true,
-              message: dupeNames.length === 1
-                ? `"${dupeNames[0]}"은(는) 이미 존재하는 문서입니다.`
-                : `${dupeNames.length}개 문서가 이미 존재합니다.`,
+              message: processingNames.length
+                ? (processingNames.length === 1
+                    ? `"${processingNames[0]}"은(는) 현재 업로드 처리 중입니다.`
+                    : `${processingNames.length}개 문서가 현재 업로드 처리 중입니다.`)
+                : (dupeNames.length === 1
+                    ? `"${dupeNames[0]}"은(는) 이미 존재하는 문서입니다.`
+                    : `${dupeNames.length}개 문서가 이미 존재합니다.`),
             }
           : null;
-        state.pendingFilenames = [];
         await loadDocuments(batchDocIds[0] || state.selectedDocumentId || "");
         renderUploadNotice();
         return;
       }
 
       if (payload.status === "failed") {
-        state.pendingFilenames = [];
-        resetUploadUiState();
-        renderDocumentList();
+        removeUploadJob(jobId);
         window.alert(String(payload.error || payload.message || "업로드 처리에 실패했습니다."));
         return;
       }
@@ -594,11 +718,10 @@
   }
 
   async function submitUploads(files) {
-    if (!files.length || state.uploadPending) {
+    if (!files.length) {
       return;
     }
 
-    setUploadPending(true);
     const formData = new FormData();
     files.forEach((file) => formData.append("documents", file, file.name));
 
@@ -608,15 +731,13 @@
       if (!response.ok) {
         throw new Error(payload.error || "업로드 실행에 실패했습니다.");
       }
-      state.pendingFilenames = files.map((f) => f.name);
+      addUploadJob(payload.job_id, files.map((f) => f.name));
       state.uploadNotice = null;
       closeUploadModal();
       resetUploadUiState();
-      renderDocumentList();
       renderUploadNotice();
       void pollJob(payload.job_id);
     } catch (error) {
-      state.pendingFilenames = [];
       resetUploadUiState();
       window.alert(String(error));
     }
@@ -663,13 +784,13 @@
 
   uploadModal.addEventListener("click", (event) => {
     const target = event.target;
-    if (target instanceof HTMLElement && target.dataset.closeModal === "true" && !state.uploadPending) {
+    if (target instanceof HTMLElement && target.dataset.closeModal === "true") {
       closeUploadModal();
     }
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && state.modalOpen && !state.uploadPending) {
+    if (event.key === "Escape" && state.modalOpen) {
       closeUploadModal();
     }
   });
@@ -770,12 +891,8 @@
     queryButton.disabled = true;
     collapseSummary();
 
-    if (!state.chatHistory[state.selectedDocumentId]) {
-      state.chatHistory[state.selectedDocumentId] = [];
-    }
-
     const entry = { question: query, result: null, loading: true };
-    state.chatHistory[state.selectedDocumentId].push(entry);
+    state.chatHistory.push(entry);
     renderChat(true);  // 질문 제출 시에만 스크롤
 
     try {

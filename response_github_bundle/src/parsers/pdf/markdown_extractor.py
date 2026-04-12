@@ -176,8 +176,19 @@ class PdfMarkdownExtractor:
                 )
         elif strategy_name == "pymupdf4llm":
             try:
-                markdown = pymupdf4llm.to_markdown(str(path))
-                metadata = {"used": bool(markdown.strip()), "source": "pymupdf4llm"}
+                page_chunks = pymupdf4llm.to_markdown(str(path), page_chunks=True)
+                if isinstance(page_chunks, list) and page_chunks:
+                    page_texts = [str(chunk.get("text") or "").strip() for chunk in page_chunks]
+                    markdown = self._page_markdown(page_texts)
+                    metadata = {
+                        "used": bool(markdown.strip()),
+                        "source": "pymupdf4llm",
+                        "page_chunks": True,
+                        "page_count": len(page_chunks),
+                    }
+                else:
+                    markdown = pymupdf4llm.to_markdown(str(path))
+                    metadata = {"used": bool(markdown.strip()), "source": "pymupdf4llm", "page_chunks": False}
                 if not markdown.strip():
                     issues.append(
                         DocumentIssue(
@@ -293,9 +304,12 @@ class PdfMarkdownExtractor:
 
     def _build_ocr_page_elements(self, document: fitz.Document) -> list[dict[str, Any]]:
         pages: list[dict[str, Any]] = []
+        mcid_lookup = self.structtree_extractor.build_mcid_lookup(document)
         for page_index in range(document.page_count):
             page = document[page_index]
             elements: list[dict[str, Any]] = []
+            resource_map = self._build_image_resource_map(page)
+            draw_ops = self._extract_image_draw_operations(page, set(resource_map))
             try:
                 image_infos = sorted(page.get_image_info(xrefs=True), key=lambda item: item.get("number", 0))
             except Exception:
@@ -304,6 +318,10 @@ class PdfMarkdownExtractor:
                 bbox = info.get("bbox") or ()
                 if len(bbox) != 4:
                     continue
+                draw_op = draw_ops[order - 1] if order - 1 < len(draw_ops) else {}
+                mcid = draw_op.get("mcid")
+                mcid_matches = mcid_lookup.get(page_index + 1, {}).get(mcid, []) if isinstance(mcid, int) else []
+                mcid_text = self._merge_mcid_text(mcid_matches)
                 elements.append(
                     {
                         "element_id": f"p{page_index + 1}-ocrimg-{order}",
@@ -315,6 +333,9 @@ class PdfMarkdownExtractor:
                             "width": info.get("width"),
                             "height": info.get("height"),
                             "xref": info.get("xref"),
+                            "mcid": mcid,
+                            "mcid_text": mcid_text or None,
+                            "mcid_roles": self._role_labels(mcid_matches),
                         },
                     }
                 )
@@ -326,12 +347,13 @@ class PdfMarkdownExtractor:
         page_ordinal = 0
         merged_lines: list[str] = []
         result_lookup = {(item.placeholder.page_number, item.placeholder.page_ordinal): item for item in results}
+        seen_merge_keys: set[tuple[int, tuple[int, int, int, int] | None, str]] = set()
 
         for line in markdown.splitlines():
-            merged_lines.append(line)
             stripped = line.strip()
             heading = stripped.lower().startswith("# page ")
             if heading:
+                merged_lines.append(line)
                 try:
                     page_number = int(stripped.split()[-1])
                     page_ordinal = 0
@@ -340,22 +362,117 @@ class PdfMarkdownExtractor:
                 continue
 
             if "intentionally omitted <==**" not in stripped:
+                merged_lines.append(line)
                 continue
 
             page_ordinal += 1
             result = result_lookup.get((page_number, page_ordinal))
-            if result is None or result.match_status != "ocr_complete" or not (result.ocr_text or "").strip():
+            if result is None:
                 continue
 
+            mcid_text = str((result.image_metadata or {}).get("mcid_text") or "").strip()
+            ocr_text = str(result.ocr_text or "").strip()
+            merged_text = mcid_text or ocr_text
+            if not merged_text:
+                continue
+
+            bbox = result.bbox if isinstance(result.bbox, list) else None
+            rounded_bbox = (
+                tuple(int(round(float(value))) for value in bbox)
+                if bbox and len(bbox) == 4
+                else None
+            )
+            normalized_text = " ".join(merged_text.split())
+            merge_key = (page_number, rounded_bbox, normalized_text)
+            if merge_key in seen_merge_keys:
+                continue
+            seen_merge_keys.add(merge_key)
+
             merged_lines.append("")
-            merged_lines.append("**----- Start of picture ocr -----**<br>")
-            for ocr_line in str(result.ocr_text).splitlines():
+            label = "picture mcid" if mcid_text else "picture ocr"
+            merged_lines.append(f"**----- Start of {label} -----**<br>")
+            for ocr_line in merged_text.splitlines():
                 normalized = ocr_line.strip()
                 if normalized:
                     merged_lines.append(f"{normalized}<br>")
-            merged_lines.append("**----- End of picture ocr -----**<br>")
+            merged_lines.append(f"**----- End of {label} -----**<br>")
 
         return "\n".join(merged_lines)
+
+    def _build_image_resource_map(self, page: fitz.Page) -> dict[str, dict[str, Any]]:
+        resources: dict[str, dict[str, Any]] = {}
+        for item in page.get_images(full=True):
+            if len(item) < 8:
+                continue
+            name = str(item[7] or "")
+            if not name:
+                continue
+            resources[name] = {
+                "name": name,
+                "xref": self._as_int(item[0]),
+            }
+        return resources
+
+    def _extract_image_draw_operations(self, page: fitz.Page, image_names: set[str]) -> list[dict[str, Any]]:
+        if not image_names:
+            return []
+        try:
+            contents = page.read_contents().decode("latin-1", errors="replace")
+        except Exception:
+            return []
+
+        token_pattern = re.compile(r"/MCID\s+(\d+)|\b(BDC|BMC|EMC)\b|/([A-Za-z0-9_.+-]+)\s+Do")
+        stack: list[int | None] = []
+        pending_mcid: int | None = None
+        operations: list[dict[str, Any]] = []
+
+        for match in token_pattern.finditer(contents):
+            mcid_value, marker, xobject_name = match.group(1), match.group(2), match.group(3)
+            if mcid_value is not None:
+                pending_mcid = int(mcid_value)
+                continue
+            if marker in {"BDC", "BMC"}:
+                stack.append(pending_mcid)
+                pending_mcid = None
+                continue
+            if marker == "EMC":
+                if stack:
+                    stack.pop()
+                pending_mcid = None
+                continue
+            if xobject_name and xobject_name in image_names:
+                current_mcid = next((value for value in reversed(stack) if value is not None), None)
+                operations.append({"xobject_name": xobject_name, "mcid": current_mcid})
+
+        return operations
+
+    def _merge_mcid_text(self, mcid_matches: list[dict[str, Any]]) -> str:
+        texts: list[str] = []
+        seen: set[str] = set()
+        for match in mcid_matches:
+            text = str(match.get("text") or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                texts.append(text)
+        return " ".join(texts[:8]).strip()
+
+    def _role_labels(self, mcid_matches: list[dict[str, Any]]) -> list[str]:
+        labels: list[str] = []
+        seen: set[str] = set()
+        for match in mcid_matches:
+            label = "{}/{}".format(match.get("block_role", "P"), match.get("leaf_role", "Span"))
+            if label not in seen:
+                seen.add(label)
+                labels.append(label)
+        return labels
+
+    def _as_int(self, value: Any) -> int | None:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _build_page_contexts(self, document: fitz.Document) -> list[PageLayoutContext]:
         contexts: list[PageLayoutContext] = []

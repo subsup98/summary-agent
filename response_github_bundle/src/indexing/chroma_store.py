@@ -46,6 +46,9 @@ class ChromaIndexManager:
 
     def find_duplicate_source(self, file_path: Path) -> dict[str, Any] | None:
         source_hash = self._hash_file(file_path)
+        return self.find_duplicate_source_by_hash(source_hash)
+
+    def find_duplicate_source_by_hash(self, source_hash: str) -> dict[str, Any] | None:
         registry = self._load_registry()
         for record in registry["documents"]:
             if record.get("source_hash") == source_hash:

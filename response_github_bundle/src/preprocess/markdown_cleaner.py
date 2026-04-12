@@ -31,6 +31,10 @@ ENHANCED_DISCLAIMER_PATTERN = re.compile(
     r"(?:forward-looking statement(?:s)?|important notice|not be relied upon)",
     re.IGNORECASE,
 )
+PICTURE_TEXT_MARKER_PATTERN = re.compile(
+    r"start of picture (?:ocr|text)|end of picture (?:ocr|text)",
+    re.IGNORECASE,
+)
 VALUE_TOKEN_PATTERN = re.compile(
     r"^[+-]?"
     r"(?:\d[\d,./]*)(?:\s*(?:%|%p|bp|억원|천원|만원|조원|원|주|배|x)?)"
@@ -110,6 +114,8 @@ class PdfMarkdownPreprocessor:
                     "preserved_candidates": [],
                 },
             )
+
+        normalized_markdown = self._strip_internal_viewer_markers(normalized_markdown)
 
         pages = self._split_pages(normalized_markdown)
         context_by_page = {context.page_number: context for context in page_contexts or []}
@@ -213,6 +219,30 @@ class PdfMarkdownPreprocessor:
             )
 
         return MarkdownPreprocessResult(markdown=cleaned_markdown, metadata=metadata, issues=issues)
+
+    def _strip_internal_viewer_markers(self, markdown: str) -> str:
+        cleaned_lines: list[str] = []
+        skip_unit_line = False
+
+        for line in markdown.splitlines():
+            stripped = line.strip()
+            lowered = stripped.lower()
+
+            if PICTURE_TEXT_MARKER_PATTERN.search(stripped):
+                continue
+            if "[financial fact table]" in lowered:
+                skip_unit_line = True
+                continue
+            if "[row_path]" in lowered:
+                continue
+            if skip_unit_line and stripped.startswith("(Unit:"):
+                skip_unit_line = False
+                continue
+
+            skip_unit_line = False
+            cleaned_lines.append(line)
+
+        return "\n".join(cleaned_lines).strip()
 
     def _profile_name(self, classification: DocumentClassification) -> str:
         producer = str(classification.metadata.get("producer") or "").lower()

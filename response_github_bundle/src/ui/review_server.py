@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import html
+import hashlib
 import json
 import queue
 import re
@@ -51,6 +52,7 @@ class ReviewSessionManager:
         self.job_lock = threading.Lock()
         self._sse_clients: list[queue.Queue] = []
         self._sse_lock = threading.Lock()
+        self._pending_source_hashes: set[str] = set()
         self.index_manager = ChromaIndexManager(project_root=project_root, embedding_backend=embedding_backend)
         ensure_directory(self.runs_root)
         ensure_directory(self.preview_root)
@@ -71,6 +73,7 @@ class ReviewSessionManager:
         ).build(run_summary)
 
     def start_run(self, uploads: list[UploadedDocument]) -> dict[str, Any]:
+        uploads_to_process, duplicate_uploads, reserved_hashes = self._reserve_uploads(uploads)
         job_id = uuid4().hex[:12]
         with self.job_lock:
             self.jobs[job_id] = {
@@ -82,7 +85,11 @@ class ReviewSessionManager:
                 "result": None,
                 "error": None,
             }
-        threading.Thread(target=self._run_job, args=(job_id, uploads), daemon=True).start()
+        threading.Thread(
+            target=self._run_job,
+            args=(job_id, uploads_to_process, duplicate_uploads, reserved_hashes),
+            daemon=True,
+        ).start()
         return self.get_job(job_id) or {}
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
@@ -90,15 +97,21 @@ class ReviewSessionManager:
             job = self.jobs.get(job_id)
             return dict(job) if job else None
 
-    def create_run(self, uploads: list[UploadedDocument], progress_callback: Callable[[str, int, int], None] | None = None) -> dict[str, Any]:
-        if not uploads:
-            raise ValueError("업로드한 문서가 없습니다.")
-
+    def create_run(
+        self,
+        uploads: list[UploadedDocument],
+        progress_callback: Callable[[str, int, int], None] | None = None,
+        *,
+        duplicate_uploads: list[dict[str, Any]] | None = None,
+        reserved_hashes: list[str] | None = None,
+    ) -> dict[str, Any]:
         run_id = self._make_run_id()
         run_started_at = iso_now()
         run_started_perf = time.perf_counter()
         session_root = self.runs_root / run_id
         source_root = session_root / "source"
+        duplicate_uploads = list(duplicate_uploads or [])
+        reserved_hashes = list(reserved_hashes or [])
         stage_timings: dict[str, Any] = {
             "run_started_at": run_started_at,
             "source_write_started_at": iso_now(),
@@ -106,187 +119,186 @@ class ReviewSessionManager:
         saved_uploads, skipped_uploads = self._write_uploads(source_root, uploads)
         stage_timings["source_write_finished_at"] = iso_now()
         stage_timings["source_write_seconds"] = round(time.perf_counter() - run_started_perf, 3)
-        if not saved_uploads:
+        if not saved_uploads and not duplicate_uploads:
             supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
             raise ValueError(f"처리 가능한 문서가 없습니다. 지원 확장자: {supported}")
 
-        project_structured_documents = self.project_root / "data" / "structured" / "documents"
-        if project_structured_documents.exists():
-            if progress_callback:
-                progress_callback("기존 파싱 결과를 벡터 DB에 반영하는 중입니다.", 0, 1)
-            stage_timings["project_sync_started_at"] = iso_now()
-            sync_started_perf = time.perf_counter()
-            self.index_manager.ingest_structured_documents(
-                structured_documents_root=project_structured_documents,
-                source_root=self.project_root / "data" / "raw",
-            )
-            stage_timings["project_sync_finished_at"] = iso_now()
-            stage_timings["project_sync_seconds"] = round(time.perf_counter() - sync_started_perf, 3)
-
-        duplicate_uploads: list[dict[str, Any]] = []
-        unique_uploads: list[dict[str, Any]] = []
-        for upload in saved_uploads:
-            duplicate = self.index_manager.find_duplicate_source(Path(upload["stored_path"]))
-            if duplicate:
-                duplicate_uploads.append(
-                    {
-                        **upload,
-                        "reason": "same_source_hash",
-                        "existing_document_id": duplicate.get("document_id"),
-                        "existing_source_name": duplicate.get("source_name"),
-                    }
+        try:
+            project_structured_documents = self.project_root / "data" / "structured" / "documents"
+            if project_structured_documents.exists():
+                if progress_callback:
+                    progress_callback("기존 파싱 결과를 벡터 DB에 반영하는 중입니다.", 0, 1)
+                stage_timings["project_sync_started_at"] = iso_now()
+                sync_started_perf = time.perf_counter()
+                self.index_manager.ingest_structured_documents(
+                    structured_documents_root=project_structured_documents,
+                    source_root=self.project_root / "data" / "raw",
                 )
-            else:
-                unique_uploads.append(upload)
+                stage_timings["project_sync_finished_at"] = iso_now()
+                stage_timings["project_sync_seconds"] = round(time.perf_counter() - sync_started_perf, 3)
 
-        if not unique_uploads:
-            total_elapsed = round(time.perf_counter() - run_started_perf, 3)
-            stage_timings["qa_ready_at"] = iso_now()
-            stage_timings["qa_ready_seconds"] = total_elapsed
+            unique_uploads = list(saved_uploads)
+
+            if not unique_uploads:
+                total_elapsed = round(time.perf_counter() - run_started_perf, 3)
+                stage_timings["qa_ready_at"] = iso_now()
+                stage_timings["qa_ready_seconds"] = total_elapsed
+                session = {
+                    "run_id": run_id,
+                    "created_at": run_started_at,
+                    "session_root": session_root.as_posix(),
+                    "review_url": "/project-parsing/index.html" if self.project_parsing_root.joinpath("index.html").exists() else None,
+                    "overlay_review_url": "/project-review/index.html" if self.project_review_root.joinpath("index.html").exists() else None,
+                    "parsing_review_url": "/project-parsing/index.html" if self.project_parsing_root.joinpath("index.html").exists() else None,
+                    "review_index_path": None,
+                    "overlay_review_index_path": None,
+                    "parsing_review_index_path": None,
+                    "latest_run_markdown_path": None,
+                    "upload_count": len(saved_uploads),
+                    "uploads": [],
+                    "duplicate_uploads": duplicate_uploads,
+                    "content_duplicate_uploads": [],
+                    "skipped_uploads": skipped_uploads,
+                    "summary": {
+                        "status": "duplicate_only",
+                        "total_documents": 0,
+                        "parsed_documents": 0,
+                        "fallback_documents": 0,
+                        "failed_documents": 0,
+                        "duplicate_documents": len(duplicate_uploads),
+                        "documents": [],
+                    },
+                    "vector_index": self.index_manager.get_status(),
+                    "timings": stage_timings,
+                }
+                write_json(session_root / "session.json", session)
+                write_json(self.latest_session_path, session)
+                return session
+
+            unique_names = {item["stored_name"] for item in unique_uploads}
+            for path in source_root.iterdir():
+                if path.is_file() and path.name not in unique_names:
+                    path.unlink()
+
+            # 파싱 완료된 문서를 즉시 벡터 인덱싱하기 위한 콜백과 결과 수집기
+            index_results: list[dict[str, Any]] = []
+            index_results_lock = threading.Lock()
+            done_count = [0]
+
+            def on_document_ready(payload: dict[str, Any]) -> None:
+                result = self.index_manager.ingest_single_document(payload, source_root=source_root)
+                with index_results_lock:
+                    index_results.append(result)
+                    done_count[0] += 1
+                    current = done_count[0]
+                self.broadcast_sse(
+                    "documents_updated",
+                    {
+                        "document_id": str(payload.get("document_id") or ""),
+                        "source_name": str(payload.get("source_name") or ""),
+                        "current": current,
+                        "total": len(unique_uploads),
+                    },
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"파싱·인덱싱 완료: {payload.get('source_name', '')} ({current}/{len(unique_uploads)})",
+                        current,
+                        len(unique_uploads),
+                    )
+            if progress_callback:
+                progress_callback(
+                    "신규 문서를 병렬 파싱·인덱싱하는 중입니다.",
+                    0,
+                    len(unique_uploads),
+                )
+            stage_timings["parse_started_at"] = iso_now()
+            parse_started_perf = time.perf_counter()
+            config = ParsingPipelineConfig(
+                source_root=source_root,
+                interim_root=session_root / "interim",
+                structured_root=session_root / "structured",
+                outputs_root=session_root / "parsing",
+                comparisons_root=session_root / "comparisons",
+                reports_root=session_root / "reports",
+                enable_omitted_picture_ocr=False,
+                on_document_ready=on_document_ready,
+            )
+            summary = ParsingPipeline(config).run()
+            stage_timings["parse_finished_at"] = iso_now()
+            stage_timings["parse_seconds"] = round(time.perf_counter() - parse_started_perf, 3)
+            pipeline_timings = summary.get("timings") or {}
+            stage_timings["document_pipeline_seconds"] = pipeline_timings.get("document_pipeline_seconds")
+            stage_timings["classification_seconds"] = pipeline_timings.get("classification_seconds")
+            stage_timings["parser_seconds"] = pipeline_timings.get("parser_seconds")
+            stage_timings["basic_summary_seconds"] = pipeline_timings.get("basic_summary_seconds")
+            stage_timings["semantic_chunk_seconds"] = pipeline_timings.get("semantic_chunk_seconds")
+            stage_timings["persist_seconds"] = pipeline_timings.get("persist_seconds")
+            stage_timings["overlay_report_seconds"] = pipeline_timings.get("overlay_report_seconds")
+            stage_timings["parsing_review_seconds"] = pipeline_timings.get("parsing_review_seconds")
+            stage_timings["report_build_seconds"] = pipeline_timings.get("report_build_seconds")
+            stage_timings["vector_index_started_at"] = stage_timings["parse_started_at"]
+            stage_timings["vector_index_finished_at"] = stage_timings["parse_finished_at"]
+            stage_timings["vector_index_seconds"] = stage_timings["parse_seconds"]
+
+            indexed_results = [r for r in index_results if r.get("status") == "indexed"]
+            duplicate_results = [r for r in index_results if r.get("status") == "duplicate"]
+            failed_results = [r for r in index_results if r.get("status") == "failed"]
+            vector_summary: dict[str, Any] = {
+                "started_at": stage_timings["parse_started_at"],
+                "finished_at": stage_timings["parse_finished_at"],
+                "total_documents": len(index_results),
+                "indexed_documents": len(indexed_results),
+                "duplicate_documents": len(duplicate_results),
+                "failed_documents": len(failed_results),
+                "documents": [r.get("record", r) for r in index_results],
+                "comparisons": [r["comparison"] for r in indexed_results if r.get("comparison")],
+            }
+
+            total_vector_documents = len(index_results)
+            ready_documents = len(indexed_results) + len(duplicate_results)
+            failed_vector_documents = len(failed_results)
+            qa_ready = total_vector_documents > 0 and ready_documents >= total_vector_documents and failed_vector_documents == 0
+            stage_timings["qa_ready"] = qa_ready
+            if qa_ready:
+                stage_timings["qa_ready_at"] = stage_timings["vector_index_finished_at"]
+                stage_timings["qa_ready_seconds"] = round(time.perf_counter() - run_started_perf, 3)
+            else:
+                stage_timings["qa_ready_at"] = None
+                stage_timings["qa_ready_seconds"] = None
+                stage_timings["qa_blocker"] = "vector_index_incomplete"
+            content_duplicate_uploads = [
+                document
+                for document in vector_summary.get("documents", [])
+                if document.get("status") == "duplicate"
+            ]
+            summary["duplicate_documents"] = len(duplicate_uploads) + len(content_duplicate_uploads)
+
             session = {
                 "run_id": run_id,
                 "created_at": run_started_at,
                 "session_root": session_root.as_posix(),
-                "review_url": "/project-parsing/index.html" if self.project_parsing_root.joinpath("index.html").exists() else None,
-                "overlay_review_url": "/project-review/index.html" if self.project_review_root.joinpath("index.html").exists() else None,
-                "parsing_review_url": "/project-parsing/index.html" if self.project_parsing_root.joinpath("index.html").exists() else None,
-                "review_index_path": None,
-                "overlay_review_index_path": None,
-                "parsing_review_index_path": None,
-                "latest_run_markdown_path": None,
+                "review_url": f"/runs/{run_id}/reports/parsing_review/index.html",
+                "overlay_review_url": f"/runs/{run_id}/reports/pdf_overlay_review/index.html",
+                "parsing_review_url": f"/runs/{run_id}/reports/parsing_review/index.html",
+                "review_index_path": (session_root / "reports" / "parsing_review" / "index.html").as_posix(),
+                "overlay_review_index_path": (session_root / "reports" / "pdf_overlay_review" / "index.html").as_posix(),
+                "parsing_review_index_path": (session_root / "reports" / "parsing_review" / "index.html").as_posix(),
+                "latest_run_markdown_path": (session_root / "parsing" / "logs" / "latest_run.md").as_posix(),
                 "upload_count": len(saved_uploads),
-                "uploads": [],
+                "uploads": unique_uploads,
                 "duplicate_uploads": duplicate_uploads,
-                "content_duplicate_uploads": [],
+                "content_duplicate_uploads": content_duplicate_uploads,
                 "skipped_uploads": skipped_uploads,
-                "summary": {
-                    "status": "duplicate_only",
-                    "total_documents": 0,
-                    "parsed_documents": 0,
-                    "fallback_documents": 0,
-                    "failed_documents": 0,
-                    "duplicate_documents": len(duplicate_uploads),
-                    "documents": [],
-                },
-                "vector_index": self.index_manager.get_status(),
+                "summary": summary,
+                "vector_index": vector_summary,
                 "timings": stage_timings,
             }
             write_json(session_root / "session.json", session)
             write_json(self.latest_session_path, session)
             return session
-
-        unique_names = {item["stored_name"] for item in unique_uploads}
-        for path in source_root.iterdir():
-            if path.is_file() and path.name not in unique_names:
-                path.unlink()
-
-        # 파싱 완료된 문서를 즉시 벡터 인덱싱하기 위한 콜백과 결과 수집기
-        index_results: list[dict[str, Any]] = []
-        index_results_lock = threading.Lock()
-        done_count = [0]
-
-        def on_document_ready(payload: dict[str, Any]) -> None:
-            result = self.index_manager.ingest_single_document(payload, source_root=source_root)
-            with index_results_lock:
-                index_results.append(result)
-                done_count[0] += 1
-                current = done_count[0]
-            if progress_callback:
-                progress_callback(
-                    f"파싱·인덱싱 완료: {payload.get('source_name', '')} ({current}/{len(unique_uploads)})",
-                    current,
-                    len(unique_uploads),
-                )
-
-        if progress_callback:
-            progress_callback("신규 문서를 병렬 파싱·인덱싱하는 중입니다.", 0, len(unique_uploads))
-        stage_timings["parse_started_at"] = iso_now()
-        parse_started_perf = time.perf_counter()
-        config = ParsingPipelineConfig(
-            source_root=source_root,
-            interim_root=session_root / "interim",
-            structured_root=session_root / "structured",
-            outputs_root=session_root / "parsing",
-            comparisons_root=session_root / "comparisons",
-            reports_root=session_root / "reports",
-            enable_omitted_picture_ocr=False,
-            on_document_ready=on_document_ready,
-        )
-        summary = ParsingPipeline(config).run()
-        stage_timings["parse_finished_at"] = iso_now()
-        stage_timings["parse_seconds"] = round(time.perf_counter() - parse_started_perf, 3)
-        pipeline_timings = summary.get("timings") or {}
-        stage_timings["document_pipeline_seconds"] = pipeline_timings.get("document_pipeline_seconds")
-        stage_timings["classification_seconds"] = pipeline_timings.get("classification_seconds")
-        stage_timings["parser_seconds"] = pipeline_timings.get("parser_seconds")
-        stage_timings["basic_summary_seconds"] = pipeline_timings.get("basic_summary_seconds")
-        stage_timings["semantic_chunk_seconds"] = pipeline_timings.get("semantic_chunk_seconds")
-        stage_timings["persist_seconds"] = pipeline_timings.get("persist_seconds")
-        stage_timings["overlay_report_seconds"] = pipeline_timings.get("overlay_report_seconds")
-        stage_timings["parsing_review_seconds"] = pipeline_timings.get("parsing_review_seconds")
-        stage_timings["report_build_seconds"] = pipeline_timings.get("report_build_seconds")
-        # 파싱·인덱싱이 동시에 진행되므로 vector_index 타이밍은 parse와 동일 구간
-        stage_timings["vector_index_started_at"] = stage_timings["parse_started_at"]
-        stage_timings["vector_index_finished_at"] = stage_timings["parse_finished_at"]
-        stage_timings["vector_index_seconds"] = stage_timings["parse_seconds"]
-
-        # 콜백으로 수집된 개별 인덱싱 결과로 vector_summary 구성
-        indexed_results = [r for r in index_results if r.get("status") == "indexed"]
-        duplicate_results = [r for r in index_results if r.get("status") == "duplicate"]
-        failed_results = [r for r in index_results if r.get("status") == "failed"]
-        vector_summary: dict[str, Any] = {
-            "started_at": stage_timings["parse_started_at"],
-            "finished_at": stage_timings["parse_finished_at"],
-            "total_documents": len(index_results),
-            "indexed_documents": len(indexed_results),
-            "duplicate_documents": len(duplicate_results),
-            "failed_documents": len(failed_results),
-            "documents": [r.get("record", r) for r in index_results],
-            "comparisons": [r["comparison"] for r in indexed_results if r.get("comparison")],
-        }
-
-        total_vector_documents = len(index_results)
-        ready_documents = len(indexed_results) + len(duplicate_results)
-        failed_vector_documents = len(failed_results)
-        qa_ready = total_vector_documents > 0 and ready_documents >= total_vector_documents and failed_vector_documents == 0
-        stage_timings["qa_ready"] = qa_ready
-        if qa_ready:
-            stage_timings["qa_ready_at"] = stage_timings["vector_index_finished_at"]
-            stage_timings["qa_ready_seconds"] = round(time.perf_counter() - run_started_perf, 3)
-        else:
-            stage_timings["qa_ready_at"] = None
-            stage_timings["qa_ready_seconds"] = None
-            stage_timings["qa_blocker"] = "vector_index_incomplete"
-        content_duplicate_uploads = [
-            document
-            for document in vector_summary.get("documents", [])
-            if document.get("status") == "duplicate"
-        ]
-        summary["duplicate_documents"] = len(duplicate_uploads) + len(content_duplicate_uploads)
-
-        session = {
-            "run_id": run_id,
-            "created_at": run_started_at,
-            "session_root": session_root.as_posix(),
-            "review_url": f"/runs/{run_id}/reports/parsing_review/index.html",
-            "overlay_review_url": f"/runs/{run_id}/reports/pdf_overlay_review/index.html",
-            "parsing_review_url": f"/runs/{run_id}/reports/parsing_review/index.html",
-            "review_index_path": (session_root / "reports" / "parsing_review" / "index.html").as_posix(),
-            "overlay_review_index_path": (session_root / "reports" / "pdf_overlay_review" / "index.html").as_posix(),
-            "parsing_review_index_path": (session_root / "reports" / "parsing_review" / "index.html").as_posix(),
-            "latest_run_markdown_path": (session_root / "parsing" / "logs" / "latest_run.md").as_posix(),
-            "upload_count": len(saved_uploads),
-            "uploads": unique_uploads,
-            "duplicate_uploads": duplicate_uploads,
-            "content_duplicate_uploads": content_duplicate_uploads,
-            "skipped_uploads": skipped_uploads,
-            "summary": summary,
-            "vector_index": vector_summary,
-            "timings": stage_timings,
-        }
-        write_json(session_root / "session.json", session)
-        write_json(self.latest_session_path, session)
-        return session
+        finally:
+            self._release_pending_hashes(reserved_hashes)
 
     def get_status(self) -> dict[str, Any]:
         return {
@@ -653,14 +665,31 @@ class ReviewSessionManager:
             return self._resolve_relative_path(self.runs_root / raw_parts[1], list(raw_parts[2:]) or ["reports", "pdf_overlay_review", "index.html"])
         return None
 
-    def _run_job(self, job_id: str, uploads: list[UploadedDocument]) -> None:
-        self._update_job(job_id, status="running", message="작업을 시작했습니다.", current=0, total=max(len(uploads), 1))
+    def _run_job(
+        self,
+        job_id: str,
+        uploads: list[UploadedDocument],
+        duplicate_uploads: list[dict[str, Any]],
+        reserved_hashes: list[str],
+    ) -> None:
+        self._update_job(
+            job_id,
+            status="running",
+            message="작업을 시작했습니다.",
+            current=0,
+            total=max(len(uploads) + len(duplicate_uploads), 1),
+        )
 
         def progress(message: str, current: int, total: int) -> None:
             self._update_job(job_id, status="running", message=message, current=current, total=max(total, 1))
 
         try:
-            session = self.create_run(uploads, progress_callback=progress)
+            session = self.create_run(
+                uploads,
+                progress_callback=progress,
+                duplicate_uploads=duplicate_uploads,
+                reserved_hashes=reserved_hashes,
+            )
         except Exception as error:
             self._update_job(job_id, status="failed", message=str(error), error=str(error))
             return
@@ -796,8 +825,138 @@ class ReviewSessionManager:
             stored_name = self._dedupe_name(safe_name, used_names)
             output_path = source_root / stored_name
             write_bytes(output_path, upload.content)
-            saved_uploads.append({"original_name": upload.filename, "stored_name": stored_name, "stored_path": output_path.as_posix(), "size_bytes": len(upload.content)})
+            saved_uploads.append({
+                "original_name": upload.filename,
+                "stored_name": stored_name,
+                "stored_path": output_path.as_posix(),
+                "size_bytes": len(upload.content),
+                "source_hash": self._hash_bytes(upload.content),
+            })
         return saved_uploads, skipped_uploads
+
+    def _partition_uploads(self, uploads: list[UploadedDocument]) -> tuple[list[UploadedDocument], list[dict[str, Any]], list[str]]:
+        uploads_to_process: list[UploadedDocument] = []
+        duplicate_uploads: list[dict[str, Any]] = []
+        seen_batch_hashes: set[str] = set()
+        with self.job_lock:
+            pending_hashes = set(self._pending_source_hashes)
+        for upload in uploads:
+            source_hash = self._hash_bytes(upload.content)
+            if source_hash in seen_batch_hashes:
+                duplicate_uploads.append({
+                    "original_name": upload.filename,
+                    "stored_name": self._sanitize_filename(upload.filename) or upload.filename,
+                    "stored_path": "",
+                    "size_bytes": len(upload.content),
+                    "source_hash": source_hash,
+                    "reason": "same_batch_source_hash",
+                    "existing_document_id": None,
+                    "existing_source_name": "same batch upload",
+                })
+                continue
+            if source_hash in pending_hashes:
+                duplicate_uploads.append({
+                    "original_name": upload.filename,
+                    "stored_name": self._sanitize_filename(upload.filename) or upload.filename,
+                    "stored_path": "",
+                    "size_bytes": len(upload.content),
+                    "source_hash": source_hash,
+                    "reason": "already_processing",
+                    "existing_document_id": None,
+                    "existing_source_name": "processing",
+                })
+                continue
+            existing = self.index_manager.find_duplicate_source_by_hash(source_hash)
+            if existing:
+                duplicate_uploads.append({
+                    "original_name": upload.filename,
+                    "stored_name": self._sanitize_filename(upload.filename) or upload.filename,
+                    "stored_path": "",
+                    "size_bytes": len(upload.content),
+                    "source_hash": source_hash,
+                    "reason": "same_source_hash",
+                    "existing_document_id": existing.get("document_id"),
+                    "existing_source_name": existing.get("source_name"),
+                })
+                continue
+            seen_batch_hashes.add(source_hash)
+            uploads_to_process.append(upload)
+        return uploads_to_process, duplicate_uploads, list(seen_batch_hashes)
+
+    def _reserve_uploads(self, uploads: list[UploadedDocument]) -> tuple[list[UploadedDocument], list[dict[str, Any]], list[str]]:
+        uploads_to_process: list[UploadedDocument] = []
+        duplicate_uploads: list[dict[str, Any]] = []
+        reserved_hashes: list[str] = []
+        seen_batch_hashes: set[str] = set()
+
+        for upload in uploads:
+            source_hash = self._hash_bytes(upload.content)
+            stored_name = self._sanitize_filename(upload.filename) or upload.filename
+            if source_hash in seen_batch_hashes:
+                duplicate_uploads.append({
+                    "original_name": upload.filename,
+                    "stored_name": stored_name,
+                    "stored_path": "",
+                    "size_bytes": len(upload.content),
+                    "source_hash": source_hash,
+                    "reason": "same_batch_source_hash",
+                    "existing_document_id": None,
+                    "existing_source_name": "same batch upload",
+                })
+                continue
+
+            existing = self.index_manager.find_duplicate_source_by_hash(source_hash)
+            if existing:
+                duplicate_uploads.append({
+                    "original_name": upload.filename,
+                    "stored_name": stored_name,
+                    "stored_path": "",
+                    "size_bytes": len(upload.content),
+                    "source_hash": source_hash,
+                    "reason": "same_source_hash",
+                    "existing_document_id": existing.get("document_id"),
+                    "existing_source_name": existing.get("source_name"),
+                })
+                continue
+
+            with self.job_lock:
+                if source_hash in self._pending_source_hashes:
+                    duplicate_uploads.append({
+                        "original_name": upload.filename,
+                        "stored_name": stored_name,
+                        "stored_path": "",
+                        "size_bytes": len(upload.content),
+                        "source_hash": source_hash,
+                        "reason": "already_processing",
+                        "existing_document_id": None,
+                        "existing_source_name": "processing",
+                    })
+                    continue
+                self._pending_source_hashes.add(source_hash)
+
+            seen_batch_hashes.add(source_hash)
+            reserved_hashes.append(source_hash)
+            uploads_to_process.append(upload)
+
+        return uploads_to_process, duplicate_uploads, reserved_hashes
+
+    def _register_pending_hashes(self, hashes: list[str]) -> None:
+        valid_hashes = [item for item in hashes if item]
+        if not valid_hashes:
+            return
+        with self.job_lock:
+            self._pending_source_hashes.update(valid_hashes)
+
+    def _release_pending_hashes(self, hashes: list[str]) -> None:
+        valid_hashes = [item for item in hashes if item]
+        if not valid_hashes:
+            return
+        with self.job_lock:
+            for item in valid_hashes:
+                self._pending_source_hashes.discard(item)
+
+    def _hash_bytes(self, content: bytes) -> str:
+        return hashlib.sha256(content).hexdigest()
 
     def _make_run_id(self) -> str:
         base = "review-" + datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1603,7 +1762,7 @@ function renderSummary(payload) {{
 function renderAnswerCard(title, result) {{
   const citations = result.citations || [];
   const matches = result.matches || result.source_documents || [];
-  return `<section class="answer-card"><h3>${{esc(title)}}</h3><p>${{esc(result.answer || '답변이 없습니다.')}}</p><div class="evidence-list">${{citations.length ? citations.map((citation) => `<div class="evidence-item"><strong>${{esc(citation.source_name || 'document')}}</strong><div class="muted">${{esc(citation.section_hint || 'section')}}</div><div style="margin-top:8px;">${{esc(citation.quote || '')}}</div></div>`).join('') : matches.slice(0, 3).map((match) => {{ const metadata = match.metadata || {{}}; const excerpt = match.document || match.page_content || ''; return `<div class="evidence-item"><strong>${{esc(metadata.source_name || metadata.document_id || 'document')}}</strong><div class="muted">${{esc(metadata.section_hint || 'section')}}</div><div style="margin-top:8px;">${{esc(String(excerpt).slice(0, 220))}}</div></div>`; }}).join('') || '<div class="evidence-item">근거가 없습니다.</div>'}}</div></section>`;
+  return `<section class="answer-card"><h3>${{esc(title)}}</h3><p>${{esc(result.answer || '답변이 없습니다.')}}</p><div class="evidence-list">${{citations.length ? citations.map((citation) => `<div class="evidence-item"><strong>${{esc(citation.source_name || 'document')}}</strong><div class="muted">${{esc(citation.section_hint || 'section')}}</div><div style="margin-top:8px; white-space:pre-wrap;">${{esc(String(citation.quote || '').replace(/<br\\s*\\/?>/gi, '\\n'))}}</div></div>`).join('') : matches.slice(0, 3).map((match) => {{ const metadata = match.metadata || {{}}; const excerpt = match.document || match.page_content || ''; return `<div class="evidence-item"><strong>${{esc(metadata.source_name || metadata.document_id || 'document')}}</strong><div class="muted">${{esc(metadata.section_hint || 'section')}}</div><div style="margin-top:8px; white-space:pre-wrap;">${{esc(String(excerpt).replace(/<br\\s*\\/?>/gi, '\\n'))}}</div></div>`; }}).join('') || '<div class="evidence-item">근거가 없습니다.</div>'}}</div></section>`;
 }}
 async function loadDocuments(preferredDocumentId = '') {{
   const response = await fetch('/api/documents');

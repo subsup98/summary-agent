@@ -15,6 +15,11 @@ OPENAI_API_URL = "https://api.openai.com/v1/responses"
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 
 
+def _open_url(req: request.Request, timeout: int) -> Any:
+    opener = request.build_opener(request.ProxyHandler({}))
+    return opener.open(req, timeout=timeout)
+
+
 @dataclass(frozen=True)
 class OpenAISettings:
     api_key: str | None
@@ -80,7 +85,10 @@ class OpenAIAnswerSynthesizer:
                         f"[SOURCE {index}]",
                         f"source_name: {item.get('source_name', '')}",
                         f"document_id: {item.get('document_id', '')}",
+                        f"page_number: {item.get('page_number', '')}",
                         f"section_hint: {item.get('section_hint', '')}",
+                        f"chunk_index: {item.get('chunk_index', '')}",
+                        f"highlight_text: {item.get('highlight_text', '')}",
                         f"excerpt: {item.get('excerpt', '')}",
                     ]
                 )
@@ -88,12 +96,18 @@ class OpenAIAnswerSynthesizer:
 
         return (
             "You are answering questions only from supplied document evidence.\n"
+            "Write in natural Korean and avoid generic AI-style phrasing.\n"
             "Return strict JSON only with this shape:\n"
-            '{"answer":"string","citations":[{"source_number":1,"source_name":"string","section_hint":"string","quote":"string"}]}\n'
+            '{"answer":"string with inline markers like [1] [2]","citations":[{"source_number":1,"source_name":"string","document_id":"string","page_number":1,"section_hint":"string","chunk_index":1,"highlight_text":"string","quote":"string"}]}\n'
             "Rules:\n"
             "- Use only the evidence provided.\n"
             "- If evidence is insufficient, say so in answer.\n"
             "- Every citation must correspond to one supplied source.\n"
+            "- Do not invent source numbers.\n"
+            "- Every inline marker used in answer must appear in citations, and every citation in citations must be used in answer.\n"
+            "- Put inline citation markers such as [1] or [2] immediately after each supported claim.\n"
+            "- Reuse the same marker when the same source supports multiple claims.\n"
+            "- Each citation should preserve where the evidence came from: source_name, page_number, and section_hint or highlight_text.\n"
             "- Keep quotes short.\n\n"
             f"Question:\n{query}\n\n"
             "Evidence:\n"
@@ -113,7 +127,7 @@ class OpenAIAnswerSynthesizer:
 
         def _do_request() -> dict[str, Any]:
             try:
-                with request.urlopen(req, timeout=60) as response:
+                with _open_url(req, timeout=60) as response:
                     return json.loads(response.read().decode("utf-8"))
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")

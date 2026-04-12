@@ -27,6 +27,33 @@ from langchain_openai import ChatOpenAI  # type: ignore  # noqa: E402
 from pydantic import Field  # type: ignore  # noqa: E402
 
 
+def _format_quote_text(text: str) -> str:
+    cleaned = re.sub(r"<br\s*/?>", "\n", str(text or ""), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _tokenize_lookup_text(text: str) -> set[str]:
+    return {token for token in re.split(r"[^\w\uAC00-\uD7A3]+", str(text or "").lower()) if token}
+
+
+def _pick_highlight_text(query: str, text: str) -> str:
+    formatted = _format_quote_text(text)
+    sentences = [item.strip() for item in re.split(r"(?<=[.!?\u3002\uFF01\uFF1F])\s+|\n+", formatted) if item.strip()]
+    if not sentences:
+        return formatted
+    query_tokens = _tokenize_lookup_text(query)
+    if not query_tokens:
+        return sentences[0]
+    scored = []
+    for sentence in sentences:
+        sentence_tokens = _tokenize_lookup_text(sentence)
+        overlap = len(query_tokens & sentence_tokens)
+        scored.append((overlap, len(sentence), sentence))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return scored[0][2]
+
+
 LANGCHAIN_SUMMARIZE_PROMPT = """당신은 한국어 문서를 빠르게 읽고 요약하는 AI입니다.
 
 아래 문서 내용을 바탕으로 다음 JSON 형식으로만 답변하세요.
@@ -52,17 +79,15 @@ Follow these rules strictly:
 - Do not guess missing numbers, dates, entities, or conclusions.
 - If the question is ambiguous, first say what is unclear, then provide only the limited facts that are explicitly supported.
 - If the context is insufficient, say exactly what is missing.
+- Write naturally in Korean and avoid boilerplate AI phrasing.
+- Add inline citation markers such as [1], [2] right after each supported claim.
+- Use the citation numbers implied by the supplied context blocks.
 
 Output format:
-Short answer:
-- Give a direct 1-3 sentence answer.
-
-Key points:
-- Provide up to 3 bullet points.
-- Include concrete figures or dates only when they appear in the retrieved chunk.
-
-Evidence:
-- Mention which document or section supports the answer.
+- Write one natural Korean answer block only.
+- Do not output headings like "Short answer", "Key points", or "Evidence".
+- Do not add a separate evidence section or chunk dump.
+- When a concrete claim is supported, attach inline citation markers like [1] right after that sentence or clause.
 
 Context:
 {context}
@@ -243,7 +268,8 @@ class LangChainRetrievalQAService:
     ) -> dict[str, Any]:
         self.refresh_catalog()
         vectorstore = self._build_vectorstore(strategy)
-        explicit_target = self._resolve_explicit_target(document_id=document_id, source_name=source_name)
+        scoped_ids = [item for item in (document_ids or []) if item]
+        explicit_target = None if scoped_ids else self._resolve_explicit_target(document_id=document_id, source_name=source_name)
         source_candidate = explicit_target or self._select_source_candidate(query)
         # 여러 문서가 선택된 경우 문서당 최소 2청크씩 가져올 수 있도록 top_k 확대
         effective_top_k = max(top_k, len(document_ids) * 2) if document_ids and len(document_ids) > 1 else top_k
@@ -258,9 +284,16 @@ class LangChainRetrievalQAService:
         if self.api_key and self.answer_model:
             try:
                 prompt = PromptTemplate(template=LANGCHAIN_QA_PROMPT)
+                numbered_documents = [
+                    Document(
+                        page_content=f"[SOURCE {index + 1}]\n{document.page_content}",
+                        metadata=dict(document.metadata),
+                    )
+                    for index, document in enumerate(source_documents)
+                ]
                 chain = RetrievalQA.from_chain_type(
                     llm=self._get_chat_llm(),
-                    retriever=StaticDocumentRetriever(documents=source_documents),
+                    retriever=StaticDocumentRetriever(documents=numbered_documents),
                     return_source_documents=True,
                     chain_type="stuff",
                     chain_type_kwargs={"prompt": prompt},
@@ -272,21 +305,35 @@ class LangChainRetrievalQAService:
                 used_documents = response.get("source_documents", [])
                 citations = [
                     {
+                        "source_number": index + 1,
                         "source_name": document.metadata.get("source_name", ""),
+                        "document_id": document.metadata.get("document_id", ""),
                         "section_hint": document.metadata.get("section_hint", ""),
-                        "quote": document.page_content[:180],
+                        "quote": _format_quote_text(
+                            document.metadata.get("original_page_content", "")
+                            or re.sub(r"^\[SOURCE\s+\d+\]\s*", "", document.page_content)
+                        ),
+                        "highlight_text": _pick_highlight_text(
+                            query,
+                            document.metadata.get("original_page_content", "")
+                            or re.sub(r"^\[SOURCE\s+\d+\]\s*", "", document.page_content),
+                        ),
                     }
-                    for document in used_documents
+                    for index, document in enumerate(used_documents)
                 ]
+                answer_text = str(response.get("result", "") or "")
+                if citations and not re.search(r"\[\d+\]", answer_text):
+                    markers = " ".join(f"[{citation['source_number']}]" for citation in citations[:2])
+                    answer_text = f"{answer_text} {markers}".strip()
                 return {
                     "query": query,
                     "strategy": strategy,
-                    "answer": response.get("result", ""),
+                    "answer": answer_text,
                     "citations": citations,
                     "document_summaries": self._build_document_summaries(used_documents),
                     "source_documents": [
                         {
-                            "page_content": document.page_content,
+                            "page_content": str(document.metadata.get("original_page_content", "") or re.sub(r"^\[SOURCE\s+\d+\]\s*", "", document.page_content)),
                             "metadata": dict(document.metadata),
                         }
                         for document in used_documents
@@ -351,30 +398,12 @@ class LangChainRetrievalQAService:
         # 선택된 문서 전체를 한 번에 검색 — 활성 문서 하나만 우선 검색하면
         # 나머지 선택 문서(예: 1분기)의 청크가 결과에서 빠지는 문제가 발생함
         if scoped_ids:
-            if explicit_candidate_id and explicit_candidate_id in scoped_ids and len(scoped_ids) > 1:
-                primary_docs = vectorstore.similarity_search_with_score(
-                    query,
-                    k=search_limit,
-                    filter={"document_id": explicit_candidate_id},
-                )
-                if primary_docs:
-                    docs_with_scores = primary_docs
-                else:
-                    secondary_ids = [item for item in scoped_ids if item != explicit_candidate_id]
-                    secondary_filter = _build_document_id_filter(secondary_ids)
-                    secondary_docs = vectorstore.similarity_search_with_score(
-                        query,
-                        k=search_limit,
-                        filter=secondary_filter,
-                    ) if secondary_filter else []
-                    docs_with_scores = secondary_docs
-            else:
-                doc_filter = _build_document_id_filter(scoped_ids)
-                docs_with_scores = vectorstore.similarity_search_with_score(
-                    query,
-                    k=search_limit,
-                    filter=doc_filter,
-                )
+            doc_filter = _build_document_id_filter(scoped_ids)
+            docs_with_scores = vectorstore.similarity_search_with_score(
+                query,
+                k=search_limit,
+                filter=doc_filter,
+            )
         elif source_candidate:
             doc_filter = {"document_id": explicit_candidate_id} if explicit_candidate_id else {"source_name": source_candidate["source_name"]}
             docs_with_scores = vectorstore.similarity_search_with_score(
@@ -389,6 +418,7 @@ class LangChainRetrievalQAService:
         query_norm = _normalize_lookup_text(query)
         for document, score in docs_with_scores:
             metadata = dict(document.metadata)
+            metadata["original_page_content"] = document.page_content
             candidate_document_id = str(metadata.get("document_id", ""))
             candidate_source_name = str(metadata.get("source_name", ""))
             source_boost = 0.0
@@ -669,13 +699,24 @@ class LangChainRetrievalQAService:
     def _fallback_answer(self, *, query: str, strategy: str, source_documents: list[Document]) -> dict[str, Any]:
         citations = [
             {
+                "source_number": index + 1,
                 "source_name": document.metadata.get("source_name", ""),
+                "document_id": document.metadata.get("document_id", ""),
                 "section_hint": document.metadata.get("section_hint", ""),
-                "quote": document.page_content[:180],
+                "quote": _format_quote_text(
+                    document.metadata.get("original_page_content", "") or document.page_content
+                ),
+                "highlight_text": _pick_highlight_text(
+                    query,
+                    document.metadata.get("original_page_content", "") or document.page_content,
+                ),
             }
-            for document in source_documents[:4]
+            for index, document in enumerate(source_documents[:4])
         ]
-        answer = source_documents[0].page_content[:400] if source_documents else "관련 문서를 찾지 못했습니다."
+        answer = str(source_documents[0].metadata.get("original_page_content", "") or source_documents[0].page_content)[:400] if source_documents else "관련 문서를 찾지 못했습니다."
+        if citations:
+            markers = " ".join(f"[{citation['source_number']}]" for citation in citations[:2])
+            answer = f"{answer} {markers}".strip()
         return {
             "query": query,
             "strategy": strategy,
@@ -684,7 +725,7 @@ class LangChainRetrievalQAService:
             "document_summaries": self._build_document_summaries(source_documents),
             "source_documents": [
                 {
-                    "page_content": document.page_content,
+                    "page_content": str(document.metadata.get("original_page_content", "") or document.page_content),
                     "metadata": dict(document.metadata),
                 }
                 for document in source_documents
