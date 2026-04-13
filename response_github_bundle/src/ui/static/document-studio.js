@@ -14,6 +14,9 @@
     summaryCache: {},
     summaryInflight: {},
     sourceContentCache: {},
+    sourceContentInflight: {},
+    originalPrefetchInflight: {},
+    originalPrefetchDone: {},
     sourceViewerDocumentId: "",
     sourceSummaryCollapsed: false,
     summaryCollapsed: false,
@@ -62,6 +65,10 @@
   const uploadDropzone = document.getElementById("upload-dropzone");
   const uploadSpinner = document.getElementById("upload-spinner");
   const uploadNoticeEl = document.getElementById("upload-notice");
+  const backgroundWarmQueue = [];
+  const backgroundWarmQueued = new Set();
+  let backgroundWarmActive = 0;
+  const BACKGROUND_WARM_CONCURRENCY = 2;
 
   if (qaCaption) {
     qaCaption.textContent = initialStatus.qa_caption || "";
@@ -155,6 +162,28 @@
       .filter(Boolean);
   }
 
+  function reconcileUploadJobsWithDocuments() {
+    const existingNames = new Set(state.documents.map((doc) => doc.source_name).filter(Boolean));
+    let changed = false;
+
+    Object.entries(state.uploadJobs).forEach(([jobId, job]) => {
+      const remaining = (job.filenames || []).filter((name) => !existingNames.has(name));
+      if (remaining.length !== (job.filenames || []).length) {
+        changed = true;
+      }
+      if (remaining.length) {
+        state.uploadJobs[jobId] = { ...job, filenames: remaining };
+        return;
+      }
+      delete state.uploadJobs[jobId];
+      changed = true;
+    });
+
+    if (changed) {
+      refreshUploadUiState();
+    }
+  }
+
   function refreshUploadUiState() {
     uploadSpinner.classList.toggle("active", Object.keys(state.uploadJobs).length > 0);
     renderDocumentList();
@@ -212,7 +241,7 @@
     deleteSelectedButton.disabled = state.checkedDocumentIds.length === 0;
   }
 
-function renderDocumentPlaceholder() {
+  function renderDocumentPlaceholder() {
     summaryContent.innerHTML = '';
     summaryContent.hidden = true;
     const selected = getSelectedDocument();
@@ -222,6 +251,11 @@ function renderDocumentPlaceholder() {
     if (!cached || cached.summary_source === "basic_summary_fallback") {
       void autoSummarizeDocument(selected.document_id);
     }
+  }
+
+  function buildDocumentOriginalUrl(doc) {
+    if (!doc?.document_id) return "";
+    return `/api/document-original?document_id=${encodeURIComponent(doc.document_id)}&source_name=${encodeURIComponent(doc.source_name || "")}`;
   }
 
   async function autoSummarizeDocument(documentId, options = {}) {
@@ -255,6 +289,98 @@ function renderDocumentPlaceholder() {
     } finally {
       delete state.summaryInflight[documentId];
     }
+  }
+
+  async function fetchDocumentContent(documentId) {
+    if (!documentId) return null;
+    if (state.sourceContentCache[documentId]) return state.sourceContentCache[documentId];
+    if (state.sourceContentInflight[documentId]) return state.sourceContentInflight[documentId];
+
+    const selected = state.documents.find((doc) => doc.document_id === documentId);
+    if (!selected) return null;
+
+    const request = (async () => {
+      try {
+        const url = `/api/document-content?document_id=${encodeURIComponent(selected.document_id)}&source_name=${encodeURIComponent(selected.source_name || "")}`;
+        const response = await fetch(url, { cache: "no-store" });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "document_content_failed");
+        state.sourceContentCache[documentId] = payload;
+      } catch (error) {
+        state.sourceContentCache[documentId] = {
+          summary_text: "문서 정보를 불러오지 못했습니다.",
+          markdown: String(error),
+          original_url: "",
+          document_type: selected.document_type || selected.extension || "",
+        };
+      } finally {
+        delete state.sourceContentInflight[documentId];
+      }
+      return state.sourceContentCache[documentId];
+    })();
+
+    state.sourceContentInflight[documentId] = request;
+    return request;
+  }
+
+  async function prefetchOriginalDocument(documentId) {
+    if (!documentId || state.originalPrefetchDone[documentId]) return;
+    if (state.originalPrefetchInflight[documentId]) return state.originalPrefetchInflight[documentId];
+
+    const doc = state.documents.find((item) => item.document_id === documentId);
+    const url = buildDocumentOriginalUrl(doc);
+    if (!url) return;
+
+    const request = (async () => {
+      try {
+        const response = await fetch(url, { cache: "force-cache" });
+        if (response.ok) {
+          await response.blob();
+          state.originalPrefetchDone[documentId] = true;
+        }
+      } catch (_) {
+        // Ignore prefetch failures and let the viewer retry on demand.
+      } finally {
+        delete state.originalPrefetchInflight[documentId];
+      }
+    })();
+
+    state.originalPrefetchInflight[documentId] = request;
+    return request;
+  }
+
+  async function warmDocumentInBackground(documentId) {
+    await Promise.allSettled([
+      autoSummarizeDocument(documentId),
+      fetchDocumentContent(documentId),
+      prefetchOriginalDocument(documentId),
+    ]);
+  }
+
+  function pumpBackgroundWarmQueue() {
+    while (backgroundWarmActive < BACKGROUND_WARM_CONCURRENCY && backgroundWarmQueue.length) {
+      const documentId = backgroundWarmQueue.shift();
+      backgroundWarmQueued.delete(documentId);
+      backgroundWarmActive += 1;
+      warmDocumentInBackground(documentId)
+        .catch(() => {})
+        .finally(() => {
+          backgroundWarmActive -= 1;
+          pumpBackgroundWarmQueue();
+        });
+    }
+  }
+
+  function scheduleBackgroundWarmup(documentIds) {
+    (documentIds || []).forEach((documentId) => {
+      if (!documentId || backgroundWarmQueued.has(documentId)) return;
+      if (state.summaryCache[documentId] && state.sourceContentCache[documentId] && state.originalPrefetchDone[documentId]) {
+        return;
+      }
+      backgroundWarmQueued.add(documentId);
+      backgroundWarmQueue.push(documentId);
+    });
+    pumpBackgroundWarmQueue();
   }
 
   function escapeRegExp(value) {
@@ -352,36 +478,8 @@ function renderDocumentPlaceholder() {
     renderDocumentList();
     renderDocumentPlaceholder();
     renderChat();
-
-    if (state.summaryCache[documentId]) {
-      renderSourceViewer();
-    } else {
-      void autoSummarizeDocument(documentId);
-    }
-
-    if (state.sourceContentCache[documentId]) {
-      renderSourceViewer();
-      return;
-    }
-
-    const selected = state.documents.find((doc) => doc.document_id === documentId);
-    if (!selected) return;
-
-    try {
-      const url = `/api/document-content?document_id=${encodeURIComponent(selected.document_id)}&source_name=${encodeURIComponent(selected.source_name || "")}`;
-      const response = await fetch(url, { cache: "no-store" });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "document_content_failed");
-      state.sourceContentCache[documentId] = payload;
-    } catch (error) {
-      state.sourceContentCache[documentId] = {
-        summary_text: "문서 정보를 불러오지 못했습니다.",
-        markdown: String(error),
-        original_url: "",
-        document_type: selected.document_type || selected.extension || "",
-      };
-    }
-
+    void autoSummarizeDocument(documentId);
+    await fetchDocumentContent(documentId);
     renderSourceViewer();
   }
 
@@ -611,6 +709,7 @@ function renderDocumentPlaceholder() {
     const response = await fetch("/api/documents", { cache: "no-store" });
     const payload = await response.json();
     state.documents = payload.documents || [];
+    reconcileUploadJobsWithDocuments();
 
     state.documents.forEach((doc) => {
       const llmCached = doc.ui_summary || doc.llm_summary;
@@ -662,6 +761,7 @@ function renderDocumentPlaceholder() {
       renderDocumentPlaceholder();
     }
     renderChat();
+    scheduleBackgroundWarmup(state.documents.map((doc) => doc.document_id));
   }
 
   async function pollJob(jobId) {
