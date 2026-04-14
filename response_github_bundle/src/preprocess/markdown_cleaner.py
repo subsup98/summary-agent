@@ -22,6 +22,20 @@ PAGE_TOKEN_PATTERN = re.compile(
 )
 STANDALONE_NUMBER_PATTERN = re.compile(r"^\d{1,4}$")
 COMMON_PERIOD_PATTERN = re.compile(r"^(?:[1-4]Q\d{2}|\d{4})$", re.IGNORECASE)
+EXTENDED_PERIOD_PATTERN = re.compile(
+    r"^(?:"
+    r"[1-4]Q\d{2}(?:[EP])?"
+    r"|(?:19|20)\d{2}(?:[EP])?"
+    r"|['’]?\d{2}\s*YTD"
+    r"|(?:19|20)\d{2}\s*YTD"
+    r"|[1-4]Q\d{2}\s*YTD"
+    r"|[12]H\d{2}"
+    r"|[1-9]\d?M\d{2}"
+    r"|FY\d{2,4}"
+    r"|\d{2,4}[EP]"
+    r")$",
+    re.IGNORECASE,
+)
 CAPTION_PROTECTION_PATTERN = re.compile(r"^(?:표|Table|Figure|그림)\s*\d*", re.IGNORECASE)
 SOURCE_PROTECTION_PATTERN = re.compile(r"^(?:자료|출처)\s*[:：]", re.IGNORECASE)
 COPYRIGHT_PATTERN = re.compile(r"(?:copyright|all rights reserved|저작권|무단전재|무단 복제)", re.IGNORECASE)
@@ -61,6 +75,15 @@ class MarkdownPreprocessResult:
 class SeriesRow:
     label: str
     values: list[str]
+
+
+@dataclass
+class SeriesLayoutCandidate:
+    periods: list[str]
+    notes: list[str]
+    rows: list[SeriesRow]
+    end_index: int
+    score: float
 
 
 @dataclass
@@ -948,7 +971,7 @@ class PdfMarkdownPreprocessor:
         stripped = line.strip()
         if not stripped:
             return False
-        return self._looks_like_value(stripped) or COMMON_PERIOD_PATTERN.fullmatch(stripped) is not None
+        return self._looks_like_value(stripped) or self._looks_like_period_token(stripped)
 
     def _looks_like_value(self, line: str) -> bool:
         stripped = line.strip()
@@ -958,7 +981,7 @@ class PdfMarkdownPreprocessor:
             return False
         if ":" in stripped and not stripped.startswith(("1Q", "2Q", "3Q", "4Q")):
             return False
-        if COMMON_PERIOD_PATTERN.fullmatch(stripped):
+        if self._looks_like_period_token(stripped):
             return True
         if re.search(r"[.!?]{2,}", stripped):
             return False
@@ -974,20 +997,20 @@ class PdfMarkdownPreprocessor:
         token_index = 0
 
         while token_index < len(tokens):
-            period_end, periods = self._collect_period_header_tokens(tokens, token_index)
+            _, periods = self._collect_period_header_tokens(tokens, token_index)
             if periods:
-                series_end, notes, rows = self._collect_series_rows_tokens(tokens, period_end, len(periods))
-                if len(rows) >= 3:
+                candidate = self._select_series_layout_candidate(tokens, token_index, periods)
+                if candidate is not None:
                     start_line = tokens[token_index][0]
-                    end_line = tokens[series_end - 1][0] + 1
+                    end_line = tokens[candidate.end_index - 1][0] + 1
                     rewritten.extend(lines[cursor_line:start_line])
-                    rewritten.extend(self._render_series_block(periods, notes, rows))
+                    rewritten.extend(self._render_series_block(candidate.periods, candidate.notes, candidate.rows))
                     rewritten.append("")
                     summary["series_tables_structured"] += 1
-                    summary["series_rows_structured"] += len(rows)
+                    summary["series_rows_structured"] += len(candidate.rows)
                     summary["changed"] = True
                     cursor_line = end_line
-                    token_index = series_end
+                    token_index = candidate.end_index
                     continue
             token_index += 1
 
@@ -1003,13 +1026,84 @@ class PdfMarkdownPreprocessor:
         index = start_index
         while index < len(tokens):
             line = tokens[index][1]
-            if not COMMON_PERIOD_PATTERN.fullmatch(line):
+            if not self._looks_like_period_token(line):
                 break
             periods.append(line)
             index += 1
         if len(periods) < 4 or len(set(periods)) != len(periods):
             return start_index, []
         return index, periods
+
+    def _select_series_layout_candidate(
+        self,
+        tokens: list[tuple[int, str]],
+        start_index: int,
+        periods: list[str],
+    ) -> SeriesLayoutCandidate | None:
+        best_candidate: SeriesLayoutCandidate | None = None
+        max_width = len(periods)
+        for width in range(max_width, 3, -1):
+            candidate_periods = periods[:width]
+            series_end, notes, rows = self._collect_series_rows_tokens(tokens, start_index + width, width)
+            if len(rows) < 3:
+                continue
+            score = self._score_series_layout_candidate(
+                tokens=tokens,
+                start_index=start_index,
+                periods=periods,
+                candidate_periods=candidate_periods,
+                rows=rows,
+                end_index=series_end,
+            )
+            candidate = SeriesLayoutCandidate(
+                periods=candidate_periods,
+                notes=notes,
+                rows=rows,
+                end_index=series_end,
+                score=score,
+            )
+            if best_candidate is None or candidate.score > best_candidate.score:
+                best_candidate = candidate
+        return best_candidate
+
+    def _score_series_layout_candidate(
+        self,
+        *,
+        tokens: list[tuple[int, str]],
+        start_index: int,
+        periods: list[str],
+        candidate_periods: list[str],
+        rows: list[SeriesRow],
+        end_index: int,
+    ) -> float:
+        score = 0.0
+        score += len(rows) * 6.0
+        score += len(candidate_periods) * 2.0
+        score += sum(self._score_period_token(period) for period in candidate_periods)
+
+        skipped_period_count = max(len(periods) - len(candidate_periods), 0)
+        if skipped_period_count:
+            score -= skipped_period_count * 8.0
+
+        if end_index > start_index + len(candidate_periods):
+            extra_period_tokens = 0
+            probe_index = start_index + len(candidate_periods)
+            while probe_index < min(end_index, len(tokens)) and self._looks_like_period_token(tokens[probe_index][1]):
+                extra_period_tokens += 1
+                probe_index += 1
+            if extra_period_tokens:
+                score -= extra_period_tokens * 10.0
+
+        unique_labels = {row.label for row in rows}
+        score += len(unique_labels) * 0.5
+        if len(unique_labels) != len(rows):
+            score -= (len(rows) - len(unique_labels)) * 3.0
+
+        row_value_lengths = [len(row.values) for row in rows]
+        if row_value_lengths and all(length == len(candidate_periods) for length in row_value_lengths):
+            score += 4.0
+
+        return score
 
     def _collect_series_rows_tokens(
         self,
@@ -1098,7 +1192,7 @@ class PdfMarkdownPreprocessor:
 
     def _is_series_note(self, line: str) -> bool:
         stripped = line.strip()
-        if not stripped or COMMON_PERIOD_PATTERN.fullmatch(stripped):
+        if not stripped or self._looks_like_period_token(stripped):
             return False
         if stripped.startswith(("*", "[")):
             return True
@@ -1107,18 +1201,50 @@ class PdfMarkdownPreprocessor:
         return not self._strip_leading_parenthetical_groups(stripped)
 
     def _is_series_boundary(self, line: str) -> bool:
-        return self._has_structural_prefix(line) or COMMON_PERIOD_PATTERN.fullmatch(line) is not None or self._looks_like_sentence(line)
+        return self._has_structural_prefix(line) or self._looks_like_period_token(line) or self._looks_like_sentence(line)
 
     def _is_series_label(self, line: str) -> bool:
         if not line or len(line) > 48:
             return False
         if self._has_structural_prefix(line):
             return False
-        if COMMON_PERIOD_PATTERN.fullmatch(line):
+        if self._looks_like_period_token(line):
             return False
         if self._looks_like_value(line):
             return False
         return bool(re.search(r"[A-Za-z가-힣]", line))
+
+    def _looks_like_period_token(self, line: str) -> bool:
+        return self._score_period_token(line) >= 0.6
+
+    def _score_period_token(self, line: str) -> float:
+        stripped = SPACE_COLLAPSE_PATTERN.sub(" ", line.strip())
+        if not stripped or len(stripped) > 20:
+            return 0.0
+        normalized = stripped.replace("’", "'").upper()
+        if COMMON_PERIOD_PATTERN.fullmatch(normalized):
+            return 1.0
+        if EXTENDED_PERIOD_PATTERN.fullmatch(normalized):
+            return 0.95
+
+        score = 0.0
+        if re.search(r"\d", normalized):
+            score += 0.25
+        if re.search(r"\b(?:YTD|FY)\b", normalized):
+            score += 0.45
+        if re.search(r"\b[1-4]Q\d{2}\b", normalized):
+            score += 0.45
+        if re.search(r"\b[12]H\d{2}\b", normalized):
+            score += 0.4
+        if re.search(r"\b[1-9]\d?M\d{2}\b", normalized):
+            score += 0.4
+        if re.search(r"\b(?:19|20)\d{2}[EP]?\b", normalized):
+            score += 0.35
+        if re.search(r"\b\d{2,4}[EP]\b", normalized):
+            score += 0.3
+        if len(normalized) <= 10:
+            score += 0.05
+        return min(score, 0.9)
 
     def _looks_like_sentence(self, line: str) -> bool:
         if len(line) < 20:

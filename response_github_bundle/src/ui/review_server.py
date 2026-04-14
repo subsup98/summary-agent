@@ -397,7 +397,9 @@ class ReviewSessionManager:
 
     _LIBREOFFICE_CANDIDATES = [
         Path("C:/Program Files/LibreOffice/program/soffice.exe"),
+        Path("C:/Program Files/LibreOffice/program/soffice.com"),
         Path("C:/Program Files (x86)/LibreOffice/program/soffice.exe"),
+        Path("C:/Program Files (x86)/LibreOffice/program/soffice.com"),
     ]
     _LIBREOFFICE_CONVERTIBLE = {".doc", ".docx", ".hwp", ".hwpx"}
 
@@ -414,6 +416,12 @@ class ReviewSessionManager:
         if not soffice:
             return False
         try:
+            ensure_directory(dest_path.parent)
+            if dest_path.exists():
+                try:
+                    dest_path.unlink()
+                except OSError:
+                    pass
             result = subprocess.run(
                 [
                     str(soffice),
@@ -425,9 +433,13 @@ class ReviewSessionManager:
                 capture_output=True,
                 timeout=120,
             )
+            if result.returncode != 0:
+                return False
             converted = dest_path.parent / (source_path.stem + ".pdf")
             if converted.exists() and converted != dest_path:
-                converted.rename(dest_path)
+                if dest_path.exists():
+                    dest_path.unlink()
+                shutil.move(str(converted), str(dest_path))
             return dest_path.exists()
         except Exception:
             return False
@@ -470,12 +482,7 @@ class ReviewSessionManager:
             margin = 40
             cursor_y = margin
             page = document.new_page(width=page_width, height=page_height)
-            font_name = "previewfont"
-            if font_path:
-                page.insert_font(fontname=font_name, fontfile=str(font_path))
-            else:
-                font_name = "helv"
-            shape = page.new_shape()
+            font_name = "helv"
 
             normalized_lines: list[str] = []
             for block in markdown.splitlines():
@@ -491,7 +498,7 @@ class ReviewSessionManager:
             for raw_line in normalized_lines:
                 line = raw_line or " "
                 box = fitz.Rect(margin, cursor_y, page_width - margin, cursor_y + 20)
-                overflow = shape.insert_textbox(
+                overflow = page.insert_textbox(
                     box,
                     line,
                     fontsize=10,
@@ -500,14 +507,10 @@ class ReviewSessionManager:
                     lineheight=1.35,
                 )
                 if overflow < 0:
-                    shape.commit()
                     page = document.new_page(width=page_width, height=page_height)
-                    if font_path:
-                        page.insert_font(fontname=font_name, fontfile=str(font_path))
-                    shape = page.new_shape()
                     cursor_y = margin
                     box = fitz.Rect(margin, cursor_y, page_width - margin, cursor_y + 20)
-                    shape.insert_textbox(
+                    page.insert_textbox(
                         box,
                         line,
                         fontsize=10,
@@ -517,14 +520,9 @@ class ReviewSessionManager:
                     )
                 cursor_y += 16
                 if cursor_y >= page_height - margin - 20:
-                    shape.commit()
                     page = document.new_page(width=page_width, height=page_height)
-                    if font_path:
-                        page.insert_font(fontname=font_name, fontfile=str(font_path))
-                    shape = page.new_shape()
                     cursor_y = margin
 
-            shape.commit()
             document.save(preview_path)
         finally:
             document.close()

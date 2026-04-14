@@ -292,7 +292,7 @@ def build_openapi_spec(host: str, port: int) -> dict[str, object]:
                         {
                             "name": "format",
                             "in": "query",
-                            "schema": {"type": "string", "enum": ["md", "txt"], "default": "md"},
+                            "schema": {"type": "string", "enum": ["md"], "default": "md"},
                             "description": "Download format",
                         },
                     ],
@@ -1843,7 +1843,6 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
               </div>
               <div class="toolbar">
                 <button class="ghost-button" id="download-md-button" type="button">?ㅼ슫濡쒕뱶 .md</button>
-                <button class="ghost-button" id="download-txt-button" type="button">?ㅼ슫濡쒕뱶 .txt</button>
                 <button class="summary-toggle" id="summary-toggle" type="button" title="?묎린 / ?쇱튂湲?>??/button>
               </div>
             </div>
@@ -1901,7 +1900,6 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     const selectAllCheck = document.getElementById('select-all-check');
     const summaryContent = document.getElementById('summary-content');
     const downloadMdButton = document.getElementById('download-md-button');
-    const downloadTxtButton = document.getElementById('download-txt-button');
     const summaryToggle = document.getElementById('summary-toggle');
     const queryForm = document.getElementById('query-form');
     const queryInput = document.getElementById('query-input');
@@ -2211,70 +2209,17 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     }}
 
     function renderAnswerBubble(result) {{
-      const isError = Boolean(result.error);
-      return `<div class="chat-answer-card">
-        <div class="chat-answer-head">
-          <h3>QA 野껉퀗??/h3>
-          ${{result.used_model ? `<span class="answer-badge">${{esc(result.used_model)}}</span>` : ''}}
-        </div>
-        <p class="chat-answer-text">${{esc(result.answer || '???????곷뮸??덈뼄.')}}</p>
-        ${{
-          isError
-            ? `<div class="evidence-list"><div class="evidence-item">QA ?遺욧퍕 筌ｌ꼶??餓???살첒揶쎛 獄쏆뮇源??됰뮸??덈뼄. ${{
-                esc(String(result.error || 'unknown_error'))
-              }}</div></div>`
-            : ''
-        }}
-      </div>`;
+      var answerHtml = result.error
+        ? ('<span style="color:var(--muted);">오류: ' + esc(String(result.error || 'unknown_error')) + '</span>')
+        : esc(result.answer || '응답을 생성할 수 없습니다.');
 
-      const evidenceHtml = isError
-        ? `<div class="evidence-item">QA ?붿껌 泥섎━ 以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎. ${{
-            esc(String(result.error || 'unknown_error'))
-          }}</div>`
-        : citations.length
-        ? citations.map((c) =>
-            `<div class="evidence-item">
-              <strong>${{esc(c.source_name || 'document')}}</strong><br>
-              <span style="color:var(--muted);">${{esc(c.section_hint || 'section')}}</span>
-              <div style="margin-top:8px; white-space:pre-wrap;">${{esc(String(c.quote || '').replace(/<br\\s*\\/?>/gi, '\\n'))}}</div>
-            </div>`
-          ).join('')
-        : matches.slice(0, 3).map((m) => {{
-            const md = m.metadata || {{}};
-            const ex = m.document || m.page_content || '';
-            return `<div class="evidence-item">
-              <strong>${{esc(md.source_name || md.document_id || 'document')}}</strong><br>
-              <span style="color:var(--muted);">${{esc(md.section_hint || 'section')}}</span>
-              <div style="margin-top:8px; white-space:pre-wrap;">${{esc(String(ex).replace(/<br\\s*\\/?>/gi, '\\n'))}}</div>
-            </div>`;
-          }}).join('') || '<div class="evidence-item">洹쇨굅媛 ?놁뒿?덈떎.</div>';
-
-      return `<div class="chat-answer-card">
-        <div class="chat-answer-head">
-          <h3>QA 寃곌낵</h3>
-          ${{result.used_model ? `<span class="answer-badge">${{esc(result.used_model)}}</span>` : ''}}
-        </div>
-        <p class="chat-answer-text">${{esc(result.answer || '?듬????놁뒿?덈떎.')}}</p>
-        <div class="evidence-list">${{evidenceHtml}}</div>
-      </div>`;
-    }}
-
-    function renderAnswerBubble(result) {{
-      const isError = Boolean(result.error);
-      return `<div class="chat-answer-card">
-        <div class="chat-answer-head">
-          <h3>QA 寃곌낵</h3>
-          ${{result.used_model ? `<span class="answer-badge">${{esc(result.used_model)}}</span>` : ''}}
-        </div>
-        <p class="chat-answer-text">${{esc(result.answer || '?듬????놁뒿?덈떎.')}}</p>
-        ${{
-          isError
-            ? `<div class="evidence-list"><div class="evidence-item">QA ?붿껌 泥섎━ 以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎. ${{
-                esc(String(result.error || 'unknown_error'))
-              }}</div></div>`
-            : ''
-        }}
-      </div>`;
+      return '<div class="chat-answer-card">'
+        + '<div class="chat-answer-head">'
+        + '<h3>QA 결과</h3>'
+        + (result.used_model ? ('<span class="answer-badge">' + esc(result.used_model) + '</span>') : '')
+        + '</div>'
+        + '<p class="chat-answer-text">' + answerHtml + '</p>'
+        + '</div>';
     }}
 
     function renderChat(scrollToBottom = false) {{
@@ -2513,7 +2458,6 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
 
       const targetDocumentId = selected.document_id;
       downloadMdButton.disabled = true;
-      downloadTxtButton.disabled = true;
 
       if (state.selectedDocumentId === targetDocumentId) {{
         summaryContent.innerHTML = '<p class="summary-text" style="color: var(--muted);">?붿빟???앹꽦?섎뒗 以묒엯?덈떎...</p>';
@@ -2537,7 +2481,6 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
         }}
       }} finally {{
         downloadMdButton.disabled = false;
-        downloadTxtButton.disabled = false;
       }}
     }}
 
@@ -2624,7 +2567,6 @@ def _render_document_studio_html_legacy(status: dict[str, object]) -> str:
     document.addEventListener('drop', (event) => event.preventDefault());
 
     downloadMdButton.addEventListener('click', () => downloadSummary('md'));
-    downloadTxtButton.addEventListener('click', () => downloadSummary('txt'));
 
     queryInput.addEventListener('keydown', (event) => {{
       if (event.key === 'Enter' && !event.shiftKey) {{
@@ -2956,7 +2898,7 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             document_id = str((query.get("document_id") or [""])[0]).strip()
             source_name = str((query.get("source_name") or [""])[0]).strip()
             output_format = str((query.get("format") or ["md"])[0]).strip().lower() or "md"
-            if output_format not in {"md", "txt"}:
+            if output_format != "md":
                 self._send_json({"error": "invalid_format"}, status=400)
                 return
             if not document_id and not source_name:
@@ -2970,12 +2912,8 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             source_label = str(result.get("source_name") or result.get("document_id") or "summary")
             summary_text = str(result.get("summary_text") or "").strip()
             key_points = [str(item).strip() for item in (result.get("key_points") or []) if str(item).strip()]
-            if output_format == "md":
-                content = self._build_summary_markdown(source_label, result, summary_text, key_points)
-                content_type = "text/markdown; charset=utf-8"
-            else:
-                content = self._build_summary_text(source_label, result, summary_text, key_points)
-                content_type = "text/plain; charset=utf-8"
+            content = self._build_summary_markdown(source_label, result, summary_text, key_points)
+            content_type = "text/markdown; charset=utf-8"
             filename = self._make_download_filename(source_label, output_format)
             self._send_download(content=content, filename=filename, content_type=content_type)
         except Exception as error:
@@ -3180,7 +3118,6 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             "",
             f"- Document ID: {result.get('document_id', '')}",
             f"- Document Type: {result.get('document_type', '')}",
-            f"- Model: {result.get('used_model', '')}",
             "",
             "## 요약",
             "",
@@ -3195,39 +3132,11 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             lines.append("- 핵심 포인트 없음")
         return "\n".join(lines) + "\n"
 
-    def _build_summary_text(
-        self,
-        source_label: str,
-        result: dict[str, object],
-        summary_text: str,
-        key_points: list[str],
-    ) -> str:
-        lines = [
-            f"{source_label} ?붿빟",
-            "=" * max(8, len(source_label) + 3),
-            f"Document ID: {result.get('document_id', '')}",
-            f"Document Type: {result.get('document_type', '')}",
-            f"Model: {result.get('used_model', '')}",
-            "",
-            "[?붿빟]",
-            summary_text or "(?붿빟 ?놁쓬)",
-            "",
-            "[?듭떖 ?ъ씤??",
-        ]
-        if key_points:
-            lines.extend([f"- {item}" for item in key_points])
-        else:
-            lines.append("- ?듭떖 ?ъ씤???놁쓬")
-        return "\n".join(lines) + "\n"
-
     def _make_download_filename(self, source_label: str, output_format: str) -> str:
-        safe_stem = "".join(
-            ch if (ch.isascii() and (ch.isalnum() or ch in {"-", "_", " "})) else "_"
-            for ch in Path(source_label).stem
-        ).strip()
-        safe_stem = "_".join(safe_stem.split()) or "summary"
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{safe_stem}_summary_{stamp}.{output_format}"
+        invalid_chars = '<>:"/\\|?*'
+        safe_stem = "".join("_" if ch in invalid_chars else ch for ch in Path(source_label).stem).strip().rstrip(".")
+        safe_stem = safe_stem or "summary"
+        return f"{safe_stem}_요약.md"
 
     def _handle_query(self) -> None:
         try:
@@ -3457,11 +3366,16 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
 
     def _send_download(self, *, content: str, filename: str, content_type: str) -> None:
         body = content.encode("utf-8")
+        ascii_filename = "".join(ch if ord(ch) < 128 and ch not in {'"', "\\"} else "_" for ch in filename) or "download.txt"
+        encoded_filename = quote(filename, safe="")
         try:
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename=\"{ascii_filename}\"; filename*=UTF-8''{encoded_filename}",
+            )
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.error):

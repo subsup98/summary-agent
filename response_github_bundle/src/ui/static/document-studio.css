@@ -873,13 +873,6 @@ button {
   word-break: break-word;
 }
 
-.source-highlight {
-  background: #fff0a8;
-  color: inherit;
-  border-radius: 4px;
-  box-shadow: 0 0 0 2px rgba(255, 213, 79, 0.35);
-}
-
 .markdown-body { color: inherit; }
 .markdown-body p { margin: 0 0 0.75em; }
 .markdown-body p:last-child { margin-bottom: 0; }
@@ -993,11 +986,11 @@ button {
   font-size: 12px;
 }
 
-.chat-citation-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+.chat-answer-reference {
   margin-top: 12px;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .source-evidence-card {
@@ -1030,17 +1023,17 @@ button {
   margin-right: -8px;
   padding: 8px;
   border-radius: 12px;
-  background: rgba(255, 244, 163, 0.35);
-  box-shadow: inset 0 0 0 1px rgba(191, 144, 0, 0.12);
+  background: rgba(168, 218, 220, 0.28);
+  box-shadow: inset 0 0 0 1px rgba(69, 123, 157, 0.18);
   scroll-margin-block: 96px;
 }
 
 .source-inline-highlight {
-  background: rgba(255, 188, 117, 0.75);
+  background: rgba(255, 196, 61, 0.88);
   color: inherit;
   border-radius: 4px;
   padding: 0 2px;
-  box-shadow: 0 0 0 1px rgba(209, 99, 0, 0.14);
+  box-shadow: 0 0 0 1px rgba(181, 131, 0, 0.2);
 }
 
 .chat-composer {

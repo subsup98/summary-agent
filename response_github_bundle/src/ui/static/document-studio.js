@@ -48,7 +48,6 @@
 
   const summaryContent = document.getElementById("summary-content");
   const downloadMdButton = document.getElementById("download-md-button");
-  const downloadTxtButton = document.getElementById("download-txt-button");
   const summaryToggle = document.getElementById("summary-toggle");
   const queryForm = document.getElementById("query-form");
   const queryInput = document.getElementById("query-input");
@@ -96,6 +95,25 @@
 
   function dedupeDocumentIds(ids) {
     return [...new Set((ids || []).filter(Boolean))];
+  }
+
+  function buildCitationSummary(result) {
+    const citations = Array.isArray(result?.citations) ? result.citations : [];
+    if (!citations.length) return "";
+
+    const seen = new Set();
+    const labels = [];
+    citations.forEach((citation) => {
+      const sourceName = String(citation?.source_name || citation?.document_id || "").trim();
+      const rawPageNumber = Number(citation?.page_number);
+      const pageNumber = Number.isFinite(rawPageNumber) ? Math.max(1, rawPageNumber - 1) : null;
+      if (!sourceName) return;
+      const label = pageNumber ? `${sourceName} p.${pageNumber}` : sourceName;
+      if (seen.has(label)) return;
+      seen.add(label);
+      labels.push(label);
+    });
+    return labels.length ? `참조: ${labels.join(", ")}` : "";
   }
 
   function getSelectedDocument() {
@@ -387,24 +405,74 @@
     return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
-  function applyHighlightHtml(html, highlightText) {
-    const needle = String(highlightText || "").trim();
+  function normalizeHighlightText(value) {
+    return String(value ?? "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function scoreTextSimilarity(sourceText, targetText) {
+    const source = normalizeHighlightText(sourceText);
+    const target = normalizeHighlightText(targetText);
+    if (!source || !target) return -1;
+    if (source.includes(target)) return 1000 + target.length;
+    if (target.includes(source)) return 800 + source.length;
+
+    const sourceTokens = new Set(source.toLowerCase().match(/[0-9a-zA-Z가-힣]+/g) || []);
+    const targetTokens = new Set(target.toLowerCase().match(/[0-9a-zA-Z가-힣]+/g) || []);
+    if (!sourceTokens.size || !targetTokens.size) return -1;
+
+    let overlap = 0;
+    targetTokens.forEach((token) => {
+      if (sourceTokens.has(token)) overlap += token.length > 1 ? 2 : 1;
+    });
+    return overlap;
+  }
+
+  function applyInlineHighlightHtml(html, highlightText) {
+    const needle = normalizeHighlightText(highlightText);
     if (!needle) return html;
     const escapedNeedle = escapeRegExp(needle);
     const regex = new RegExp(escapedNeedle, "i");
     if (!regex.test(html)) return html;
-    return html.replace(regex, (match) => `<mark class="source-highlight">${match}</mark>`);
+    return html.replace(regex, (match) => `<mark class="source-inline-highlight">${match}</mark>`);
   }
 
-  function formatMarkdownForViewer(markdown, highlightText = "") {
+  function formatMarkdownForViewer(markdown, highlight = null) {
     if (!markdown) {
       return '<div class="muted">파싱 결과가 없습니다.</div>';
     }
-    const html = esc(markdown)
+
+    const highlightText = highlight?.highlight_text || "";
+    const blockText = highlight?.block_text || highlightText;
+    const blocks = esc(markdown)
       .split(/\n{2,}/)
-      .map((block) => `<p>${block.replace(/\n/g, "<br>")}</p>`)
-      .join("");
-    return applyHighlightHtml(html, highlightText);
+      .map((block) => block.trim())
+      .filter(Boolean);
+
+    let bestIndex = -1;
+    let bestScore = -1;
+    blocks.forEach((block, index) => {
+      const score = scoreTextSimilarity(block, blockText);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = index;
+      }
+    });
+
+    return blocks.map((block, index) => {
+      let blockHtml = block.replace(/\n/g, "<br>");
+      if (index === bestIndex && blockText) {
+        blockHtml = `<span class="source-block-highlight">${blockHtml}</span>`;
+      }
+      if (index === bestIndex && highlightText) {
+        blockHtml = applyInlineHighlightHtml(blockHtml, highlightText);
+      }
+      return `<p>${blockHtml}</p>`;
+    }).join("");
   }
 
   function renderOriginalPreview(content) {
@@ -457,9 +525,9 @@
     sourceDetailOriginal.innerHTML = renderOriginalPreview(content);
     sourceDetailContent.innerHTML = formatMarkdownForViewer(
       content.markdown || "",
-      state.sourceHighlight?.highlight_text || "",
+      state.sourceHighlight,
     );
-    const marker = sourceDetailContent.querySelector(".source-highlight");
+    const marker = sourceDetailContent.querySelector(".source-inline-highlight, .source-block-highlight");
     if (marker) {
       marker.scrollIntoView({ behavior: "smooth", block: "center" });
     }
@@ -470,9 +538,12 @@
     summaryContent.classList.add("guide-collapsed");
   }
 
-  async function openSourceViewer(documentId) {
+  async function openSourceViewer(documentId, options = {}) {
+    const syncSelection = options.syncSelection !== false;
     state.sourceViewerDocumentId = documentId;
-    state.selectedDocumentId = documentId;
+    if (syncSelection) {
+      state.selectedDocumentId = documentId;
+    }
     collapseSummary();
     renderSourceViewer();
     renderDocumentList();
@@ -496,19 +567,9 @@
     state.sourceHighlight = {
       page_number: citation.page_number || null,
       highlight_text: citation.highlight_text || citation.quote || "",
+      block_text: citation.chunk_text || citation.quote || citation.highlight_text || "",
     };
-    await openSourceViewer(documentId);
-  }
-
-  function renderAnswerTextWithInlineCitations(result) {
-    const citationMap = new Map((result.citations || []).map((citation) => [String(citation.source_number), citation]));
-    const html = renderMarkdown(result.answer || "응답이 없습니다.");
-    return html.replace(/\[(\d+)\]/g, (full, number) => {
-      const citation = citationMap.get(String(number));
-      if (!citation) return full;
-      const title = `${citation.source_name || "문서"}${citation.page_number ? ` · p.${citation.page_number}` : ""}`;
-      return `<button class="inline-citation-link" type="button" data-inline-citation-document-id="${esc(citation.document_id || "")}" data-inline-citation-page="${esc(citation.page_number ?? "")}" data-inline-citation-highlight="${esc(citation.highlight_text || citation.quote || "")}" title="${esc(title)}">[${esc(number)}]</button>`;
-    });
+    await openSourceViewer(documentId, { syncSelection: false });
   }
 
   function renderUploadNotice() {
@@ -604,55 +665,14 @@
 
   function renderAnswerBubble(result) {
     const isError = Boolean(result.error);
-    const citations = result.citations || [];
-    const matches = result.matches || result.source_documents || [];
-    
-    function buildCitationMeta(item) {
-      const parts = [];
-      if (item.source_name) parts.push(item.source_name);
-      if (item.page_number !== null && item.page_number !== undefined && item.page_number !== "") {
-        parts.push(`p.${item.page_number}`);
-      }
-      return parts.join(" · ");
-    }
-
-    const evidenceHtml = isError
-      ? `<div class="evidence-item">질문 처리 중 오류가 발생했습니다. ${esc(String(result.error || "unknown_error"))}</div>`
-      : citations.length
-        ? citations.map((citation) => {
-            const meta = buildCitationMeta(citation);
-            return `
-            <button
-              class="answer-evidence-card"
-              type="button"
-              data-citation-document-id="${esc(citation.document_id || "")}"
-              data-citation-page="${esc(citation.page_number ?? "")}"
-              data-citation-highlight="${esc(citation.highlight_text || citation.quote || "")}"
-            >
-              <div class="answer-evidence-card-head">
-                <span class="answer-evidence-card-number">[${esc(citation.source_number || "")}]</span>
-                <span class="answer-evidence-card-meta">${esc(meta || "문서 위치")}</span>
-              </div>
-            </button>
-          `;
-          }).join("")
-        : matches.slice(0, 3).map((match) => {
-            const metadata = match.metadata || {};
-            const meta = buildCitationMeta(metadata);
-            return `
-              <div class="evidence-item">
-                <strong>${esc(meta || metadata.source_name || metadata.document_id || "document")}</strong>
-              </div>
-            `;
-          }).join("") || '<div class="evidence-item">근거가 없습니다.</div>';
-
+    const citationSummary = buildCitationSummary(result);
     return `
       <div class="chat-answer-card">
         <div class="chat-answer-head">
           <h3>답변</h3>
         </div>
-        <div class="chat-answer-text markdown-body">${renderAnswerTextWithInlineCitations(result)}</div>
-        ${isError ? `<div class="evidence-list">${evidenceHtml}</div>` : ""}
+        <div class="chat-answer-text markdown-body">${renderMarkdown(result.answer || (isError ? `오류: ${String(result.error || "unknown_error")}` : "응답이 없습니다."))}</div>
+        ${citationSummary ? `<div class="chat-answer-reference">${esc(citationSummary)}</div>` : ""}
       </div>
     `;
   }
@@ -677,25 +697,6 @@
         </div>
       `;
     }).join("");
-
-    chatHistoryEl.querySelectorAll("[data-citation-document-id]").forEach((button) => {
-      button.addEventListener("click", async () => {
-        await focusCitation({
-          document_id: button.getAttribute("data-citation-document-id") || "",
-          page_number: button.getAttribute("data-citation-page") || "",
-          highlight_text: button.getAttribute("data-citation-highlight") || "",
-        });
-      });
-    });
-    chatHistoryEl.querySelectorAll("[data-inline-citation-document-id]").forEach((button) => {
-      button.addEventListener("click", async () => {
-        await focusCitation({
-          document_id: button.getAttribute("data-inline-citation-document-id") || "",
-          page_number: button.getAttribute("data-inline-citation-page") || "",
-          highlight_text: button.getAttribute("data-inline-citation-highlight") || "",
-        });
-      });
-    });
 
     if (scrollToBottom) {
       requestAnimationFrame(() => {
@@ -944,13 +945,14 @@
   document.addEventListener("dragover", (event) => event.preventDefault());
   document.addEventListener("drop", (event) => event.preventDefault());
 
-  summaryToggle.addEventListener("click", () => {
-    state.summaryCollapsed = !state.summaryCollapsed;
-    summaryContent.classList.toggle("guide-collapsed", state.summaryCollapsed);
-  });
+  if (summaryToggle) {
+    summaryToggle.addEventListener("click", () => {
+      state.summaryCollapsed = !state.summaryCollapsed;
+      summaryContent.classList.toggle("guide-collapsed", state.summaryCollapsed);
+    });
+  }
 
   downloadMdButton.addEventListener("click", () => downloadSummary("md"));
-  downloadTxtButton.addEventListener("click", () => downloadSummary("txt"));
   selectAllRow.addEventListener("click", () => {
     const allChecked = state.documents.every((doc) => state.checkedDocumentIds.includes(doc.document_id));
     state.checkedDocumentIds = allChecked ? [] : state.documents.map((doc) => doc.document_id);
@@ -996,14 +998,15 @@
     renderChat(true);  // 질문 제출 시에만 스크롤
 
     try {
+      const useScopedOnly = scopedDocumentIds.length > 0;
       const response = await fetch("/api/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query,
           strategy: defaultQaStrategy,
-          document_id: selected.document_id,
-          source_name: selected.source_name,
+          document_id: useScopedOnly ? "" : selected.document_id,
+          source_name: useScopedOnly ? "" : selected.source_name,
           selected_document_ids: scopedDocumentIds,
         }),
       });

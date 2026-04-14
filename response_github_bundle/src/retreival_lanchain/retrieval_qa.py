@@ -80,15 +80,12 @@ Follow these rules strictly:
 - If the question is ambiguous, first say what is unclear, then provide only the limited facts that are explicitly supported.
 - If the context is insufficient, say exactly what is missing.
 - Write naturally in Korean and avoid boilerplate AI phrasing.
-- Add inline citation markers such as [1], [2] right after each supported claim.
-- Use the citation numbers implied by the supplied context blocks.
+- Do not add inline citation markers like [1] or [2] in the answer text.
 
 Output format:
 - Write one natural Korean answer block only.
 - Do not output headings like "Short answer", "Key points", or "Evidence".
 - Do not add a separate evidence section or chunk dump.
-- When a concrete claim is supported, attach inline citation markers like [1] right after that sentence or clause.
-
 Context:
 {context}
 
@@ -309,6 +306,10 @@ class LangChainRetrievalQAService:
                         "source_name": document.metadata.get("source_name", ""),
                         "document_id": document.metadata.get("document_id", ""),
                         "section_hint": document.metadata.get("section_hint", ""),
+                        "page_number": self._resolve_document_page_number(
+                            document=document,
+                            query=query,
+                        ),
                         "quote": _format_quote_text(
                             document.metadata.get("original_page_content", "")
                             or re.sub(r"^\[SOURCE\s+\d+\]\s*", "", document.page_content)
@@ -321,14 +322,10 @@ class LangChainRetrievalQAService:
                     }
                     for index, document in enumerate(used_documents)
                 ]
-                answer_text = str(response.get("result", "") or "")
-                if citations and not re.search(r"\[\d+\]", answer_text):
-                    markers = " ".join(f"[{citation['source_number']}]" for citation in citations[:2])
-                    answer_text = f"{answer_text} {markers}".strip()
                 return {
                     "query": query,
                     "strategy": strategy,
-                    "answer": answer_text,
+                    "answer": str(response.get("result", "") or "").strip(),
                     "citations": citations,
                     "document_summaries": self._build_document_summaries(used_documents),
                     "source_documents": [
@@ -696,6 +693,129 @@ class LangChainRetrievalQAService:
                 roots.append(path)
         return roots
 
+    def _resolve_document_page_number(self, *, document: Document, query: str) -> int | None:
+        metadata = document.metadata or {}
+        existing_page = metadata.get("page_number")
+        quote_text = _format_quote_text(
+            metadata.get("original_page_content", "") or re.sub(r"^\[SOURCE\s+\d+\]\s*", "", document.page_content)
+        )
+        highlight_text = _pick_highlight_text(query, quote_text)
+        looked_up_page = self._lookup_page_number(
+            str(metadata.get("document_id", "")),
+            highlight_text,
+            quote_text,
+        )
+        return looked_up_page if looked_up_page is not None else existing_page
+
+    def _lookup_page_number(self, document_id: str, *text_candidates: str) -> int | None:
+        if not document_id:
+            return None
+        normalized_candidates = [
+            _format_quote_text(text)
+            for text in text_candidates
+            if _format_quote_text(text)
+        ]
+        if not normalized_candidates:
+            return None
+
+        primary_text = normalized_candidates[0]
+        primary_tokens = _tokenize_lookup_text(primary_text)
+        if not primary_tokens:
+            return None
+
+        best_page: int | None = None
+        best_score = -1.0
+        for root in self._structured_document_roots():
+            if not root.exists():
+                continue
+            for path in root.glob("*.json"):
+                try:
+                    payload = json.loads(read_text_with_fallback(path)[0])
+                except Exception:
+                    continue
+                if str(payload.get("document_id", "")) != document_id:
+                    continue
+                markdown_pages = self._extract_markdown_pages(payload)
+                if markdown_pages:
+                    for page_number, page_text in markdown_pages:
+                        chunk_tokens = _tokenize_lookup_text(page_text)
+                        if not chunk_tokens:
+                            continue
+
+                        score = 0.0
+                        if primary_text and primary_text in page_text:
+                            score += 1500.0
+                        elif primary_text and page_text in primary_text:
+                            score += 900.0
+
+                        for candidate in normalized_candidates[1:]:
+                            if candidate and candidate in page_text:
+                                score += 220.0
+
+                        overlap = len(primary_tokens & chunk_tokens)
+                        if overlap:
+                            score += overlap * 10.0
+
+                        if score > best_score:
+                            best_score = score
+                            best_page = page_number
+                for chunk in payload.get("chunks", []):
+                    page = chunk.get("page") or chunk.get("page_number")
+                    if not page:
+                        continue
+                    chunk_text = _format_quote_text(str(chunk.get("serialized_text") or chunk.get("text") or ""))
+                    if not chunk_text:
+                        continue
+                    chunk_tokens = _tokenize_lookup_text(chunk_text)
+                    if not chunk_tokens:
+                        continue
+
+                    score = 0.0
+                    if primary_text and primary_text in chunk_text:
+                        score += 1000.0
+                    elif primary_text and chunk_text in primary_text:
+                        score += 700.0
+
+                    for candidate in normalized_candidates[1:]:
+                        if candidate and candidate in chunk_text:
+                            score += 180.0
+
+                    overlap = len(primary_tokens & chunk_tokens)
+                    if overlap:
+                        score += overlap * 12.0
+
+                    if score > best_score:
+                        best_score = score
+                        try:
+                            best_page = int(page)
+                        except (TypeError, ValueError):
+                            pass
+                break
+        return best_page if best_score > 0 else None
+
+    def _extract_markdown_pages(self, payload: dict[str, Any]) -> list[tuple[int, str]]:
+        markdown = _format_quote_text(
+            str(payload.get("markdown_raw") or payload.get("markdown") or "")
+        )
+        if not markdown:
+            return []
+        matches = list(re.finditer(r"(?im)^#\s*Page\s+(\d+)\s*$", markdown))
+        if not matches:
+            return []
+
+        pages: list[tuple[int, str]] = []
+        for index, match in enumerate(matches):
+            try:
+                page_number = int(match.group(1))
+            except ValueError:
+                continue
+            start = match.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
+            page_text = _format_quote_text(markdown[start:end])
+            if page_text:
+                pages.append((page_number, page_text))
+        return pages
+
     def _fallback_answer(self, *, query: str, strategy: str, source_documents: list[Document]) -> dict[str, Any]:
         citations = [
             {
@@ -703,6 +823,10 @@ class LangChainRetrievalQAService:
                 "source_name": document.metadata.get("source_name", ""),
                 "document_id": document.metadata.get("document_id", ""),
                 "section_hint": document.metadata.get("section_hint", ""),
+                "page_number": self._resolve_document_page_number(
+                    document=document,
+                    query=query,
+                ),
                 "quote": _format_quote_text(
                     document.metadata.get("original_page_content", "") or document.page_content
                 ),
@@ -714,9 +838,6 @@ class LangChainRetrievalQAService:
             for index, document in enumerate(source_documents[:4])
         ]
         answer = str(source_documents[0].metadata.get("original_page_content", "") or source_documents[0].page_content)[:400] if source_documents else "관련 문서를 찾지 못했습니다."
-        if citations:
-            markers = " ".join(f"[{citation['source_number']}]" for citation in citations[:2])
-            answer = f"{answer} {markers}".strip()
         return {
             "query": query,
             "strategy": strategy,

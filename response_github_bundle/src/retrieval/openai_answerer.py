@@ -74,7 +74,8 @@ class OpenAIAnswerSynthesizer:
         }
         raw = self._post(payload)
         text = self._extract_text(raw)
-        return self._parse_json_response(text)
+        result = self._parse_json_response(text)
+        return result
 
     def _build_prompt(self, query: str, evidence: list[dict[str, Any]]) -> str:
         evidence_lines: list[str] = []
@@ -95,19 +96,19 @@ class OpenAIAnswerSynthesizer:
             )
 
         return (
-            "You are answering questions only from supplied document evidence.\n"
-            "Write in natural Korean and avoid generic AI-style phrasing.\n"
+            "You are an expert document summarizer. Your role is to extract and present only what the provided evidence explicitly states.\n"
+            "Write in natural Korean. Be concise and precise. Do not guess, infer, or add information not present in the evidence.\n"
+            "If the evidence is insufficient to answer, clearly state that in the answer field.\n"
             "Return strict JSON only with this shape:\n"
-            '{"answer":"string with inline markers like [1] [2]","citations":[{"source_number":1,"source_name":"string","document_id":"string","page_number":1,"section_hint":"string","chunk_index":1,"highlight_text":"string","quote":"string"}]}\n'
+            '{"answer":"string","citations":[{"source_number":1,"quote":"string"}]}\n'
             "Rules:\n"
-            "- Use only the evidence provided.\n"
-            "- If evidence is insufficient, say so in answer.\n"
+            "- Use only the evidence provided. Do not hallucinate or add unsupported claims.\n"
+            "- Do not use inline markers like [1] or [2] in the answer text.\n"
+            "- Write the answer as natural flowing Korean text without any citation markers.\n"
             "- Every citation must correspond to one supplied source.\n"
-            "- Do not invent source numbers.\n"
-            "- Every inline marker used in answer must appear in citations, and every citation in citations must be used in answer.\n"
-            "- Put inline citation markers such as [1] or [2] immediately after each supported claim.\n"
-            "- Reuse the same marker when the same source supports multiple claims.\n"
-            "- Each citation should preserve where the evidence came from: source_name, page_number, and section_hint or highlight_text.\n"
+            "- Do not invent sources or page numbers.\n"
+            "- For citations, choose only the source_number values from the provided evidence.\n"
+            "- Do not emit source_name, document_id, page_number, or section metadata yourself.\n"
             "- Keep quotes short.\n\n"
             f"Question:\n{query}\n\n"
             "Evidence:\n"
@@ -158,3 +159,4 @@ class OpenAIAnswerSynthesizer:
             if not match:
                 raise RuntimeError("OpenAI response was not valid JSON")
             return json.loads(match.group(0))
+

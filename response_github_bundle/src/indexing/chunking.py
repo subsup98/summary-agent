@@ -18,6 +18,9 @@ from langchain_experimental.text_splitter import SemanticChunker  # type: ignore
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣]+", re.UNICODE)
+TABLE_ROW_RE = re.compile(r"^\s*\|")
+TABLE_META_RE = re.compile(r"^\[표: \d+행 × \d+열\]$")
+_TABLE_NEWLINE_PLACEHOLDER = "\x00TBNL\x00"
 
 
 @dataclass
@@ -176,12 +179,13 @@ def build_semantic_chunks(markdown: str, embeddings: Embeddings | None = None) -
             }
         ]
 
+    protected_text = _protect_table_newlines(clean_text)
     splitter = SemanticChunker(
         active_embeddings,
         sentence_split_regex=r"(?<=[.!?])\s+|\n+",
     )
     try:
-        raw_chunks = [chunk.strip() for chunk in splitter.split_text(clean_text) if chunk.strip()]
+        raw_chunks = [_restore_table_newlines(chunk).strip() for chunk in splitter.split_text(protected_text) if chunk.strip()]
     except Exception:
         raw_chunks = _fallback_semantic_chunks(clean_text)
     if not raw_chunks:
@@ -254,7 +258,40 @@ def _make_rule_chunk(chunks: list[dict[str, Any]], parts: list[str], sections: l
     }
 
 
+def _is_table_line(line: str) -> bool:
+    return bool(TABLE_ROW_RE.match(line) or TABLE_META_RE.match(line.strip()))
+
+
+def _is_table_block(text: str) -> bool:
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    return len(lines) >= 2 and all(_is_table_line(line) for line in lines)
+
+
+def _protect_table_newlines(text: str) -> str:
+    """표 블록 내부의 \n을 placeholder로 치환해 청커가 표 행을 분리하지 못하게 함."""
+    result: list[str] = []
+    in_table = False
+    for line in text.splitlines():
+        if _is_table_line(line):
+            if in_table:
+                result.append(_TABLE_NEWLINE_PLACEHOLDER + line)
+            else:
+                in_table = True
+                result.append(line)
+        else:
+            in_table = False
+            result.append(line)
+    return "\n".join(result)
+
+
+def _restore_table_newlines(text: str) -> str:
+    return text.replace(_TABLE_NEWLINE_PLACEHOLDER, "\n")
+
+
 def _split_large_paragraph(paragraph: str, chunk_size: int, overlap: int) -> list[str]:
+    if _is_table_block(paragraph):
+        return [paragraph]
+
     sentences = [sentence.strip() for sentence in SENTENCE_BOUNDARY_RE.split(paragraph) if sentence.strip()]
     if not sentences:
         return [paragraph[:chunk_size]]

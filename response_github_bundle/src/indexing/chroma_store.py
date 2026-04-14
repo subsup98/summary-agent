@@ -288,6 +288,7 @@ class ChromaIndexManager:
                 "chunk_index": chunk["chunk_index"],
                 "char_count": chunk["char_count"],
                 "section_hint": chunk.get("section_hint") or "",
+                "page_number": chunk.get("page_number") if chunk.get("page_number") is not None else "",
                 "content_hash": content_hash,
             }
             for chunk in prepared_chunks

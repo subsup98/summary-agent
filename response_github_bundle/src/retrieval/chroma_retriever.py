@@ -43,6 +43,9 @@ class ChromaRetriever:
         )
         query_embedding = self.embeddings.embed_query(query)
         scoped_ids = {item for item in (document_ids or []) if item}
+        if scoped_ids:
+            document_id = ""
+            source_name = ""
         require_filter = bool(scoped_ids or document_id or source_name)
         n_results = top_k
         if require_filter:
@@ -75,8 +78,9 @@ class ChromaRetriever:
                     "metadata": metadata,
                 }
             )
-            if len(matches) >= top_k:
-                break
+        matches.sort(key=lambda item: self._match_sort_key(query, item))
+        if len(matches) >= top_k:
+            return matches[:top_k]
         if matches:
             return matches
         return self._search_structured_documents(
@@ -213,6 +217,9 @@ class ChromaRetriever:
         document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         scoped_ids = {item for item in (document_ids or []) if item}
+        if scoped_ids:
+            document_id = ""
+            source_name = ""
         scored: list[dict[str, Any]] = []
         query_tokens = self._tokens(query)
 
@@ -276,8 +283,22 @@ class ChromaRetriever:
                         }
                     )
 
-        scored.sort(key=lambda item: item.get("distance", 9999.0))
+        scored.sort(key=lambda item: self._match_sort_key(query, item))
         return scored[:top_k]
+
+    def _match_sort_key(self, query: str, match: dict[str, Any]) -> tuple[float, float]:
+        metadata = match.get("metadata", {}) or {}
+        query_tokens = self._tokens(query)
+        source_tokens = self._tokens(str(metadata.get("source_name") or ""))
+        section_tokens = self._tokens(str(metadata.get("section_hint") or ""))
+        document_tokens = self._tokens(str(match.get("document") or ""))
+        overlap = (
+            len(query_tokens & source_tokens) * 6
+            + len(query_tokens & section_tokens) * 3
+            + len(query_tokens & document_tokens)
+        )
+        distance = float(match.get("distance", 9999.0) or 9999.0)
+        return (-overlap, distance)
 
     def _build_evidence(self, matches: list[dict[str, Any]], ranked_sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
         evidence: list[dict[str, Any]] = []
@@ -289,12 +310,17 @@ class ChromaRetriever:
             if key in used_keys:
                 continue
             used_keys.add(key)
+            page_number = metadata.get("page_number") or self._lookup_page_number(
+                str(metadata.get("document_id", "")),
+                item["sentence"],
+                item.get("document", "") or "",
+            )
             evidence.append(
                 {
                     "source_name": metadata.get("source_name", ""),
                     "document_id": metadata.get("document_id", ""),
                     "section_hint": metadata.get("section_hint", ""),
-                    "page_number": metadata.get("page_number"),
+                    "page_number": page_number,
                     "chunk_index": metadata.get("chunk_index"),
                     "excerpt": self._format_quote_text(item.get("document", "") or item["sentence"]),
                     "highlight_text": self._format_quote_text(item["sentence"]),
@@ -306,12 +332,16 @@ class ChromaRetriever:
 
         for match in matches[:3]:
             metadata = match.get("metadata", {})
+            page_number = metadata.get("page_number") or self._lookup_page_number(
+                str(metadata.get("document_id", "")),
+                match.get("document", "") or "",
+            )
             evidence.append(
                 {
                     "source_name": metadata.get("source_name", ""),
                     "document_id": metadata.get("document_id", ""),
                     "section_hint": metadata.get("section_hint", ""),
-                    "page_number": metadata.get("page_number"),
+                    "page_number": page_number,
                     "chunk_index": metadata.get("chunk_index"),
                     "excerpt": self._format_quote_text(match.get("document", "") or ""),
                     "highlight_text": "",
@@ -319,18 +349,132 @@ class ChromaRetriever:
             )
         return evidence
 
+    def _lookup_page_number(self, document_id: str, *text_candidates: str) -> int | None:
+        """structured JSON의 markdown/chunks에서 텍스트와 가장 유사한 실제 페이지 번호를 반환."""
+        if not document_id:
+            return None
+        normalized_candidates = [
+            self._format_quote_text(text)
+            for text in text_candidates
+            if self._format_quote_text(text)
+        ]
+        if not normalized_candidates:
+            return None
+
+        primary_text = normalized_candidates[0]
+        primary_tokens = self._tokens(primary_text)
+        if not primary_tokens:
+            return None
+
+        best_page: int | None = None
+        best_score = -1.0
+        for root in self._structured_document_roots():
+            if not root.exists():
+                continue
+            for path in root.glob("*.json"):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if str(data.get("document_id", "")) != document_id:
+                    continue
+                markdown_pages = self._extract_markdown_pages(data)
+                if markdown_pages:
+                    for page_number, page_text in markdown_pages:
+                        text_tokens = self._tokens(page_text)
+                        if not text_tokens:
+                            continue
+
+                        score = 0.0
+                        if primary_text and primary_text in page_text:
+                            score += 1500.0
+                        elif primary_text and page_text in primary_text:
+                            score += 900.0
+
+                        for candidate in normalized_candidates[1:]:
+                            if candidate and candidate in page_text:
+                                score += 220.0
+
+                        overlap = len(primary_tokens & text_tokens)
+                        if overlap:
+                            score += overlap * 10.0
+
+                        if score > best_score:
+                            best_score = score
+                            best_page = page_number
+                for item in data.get("chunks", []):
+                    page = item.get("page") or item.get("page_number")
+                    if not page:
+                        continue
+                    text = self._format_quote_text(str(item.get("serialized_text") or item.get("text") or ""))
+                    if not text:
+                        continue
+                    text_tokens = self._tokens(text)
+                    if not text_tokens:
+                        continue
+
+                    score = 0.0
+                    if primary_text and primary_text in text:
+                        score += 1000.0
+                    elif primary_text and text in primary_text:
+                        score += 700.0
+
+                    for candidate in normalized_candidates[1:]:
+                        if candidate and candidate in text:
+                            score += 180.0
+
+                    overlap = len(primary_tokens & text_tokens)
+                    if overlap:
+                        score += overlap * 12.0
+                    if score > best_score:
+                        best_score = score
+                        try:
+                            best_page = int(page)
+                        except (TypeError, ValueError):
+                            pass
+                break
+        return best_page if best_score > 0 else None
+
+    def _extract_markdown_pages(self, payload: dict[str, Any]) -> list[tuple[int, str]]:
+        markdown = self._format_quote_text(
+            str(payload.get("markdown_raw") or payload.get("markdown") or "")
+        )
+        if not markdown:
+            return []
+        matches = list(re.finditer(r"(?im)^#\s*Page\s+(\d+)\s*$", markdown))
+        if not matches:
+            return []
+
+        pages: list[tuple[int, str]] = []
+        for index, match in enumerate(matches):
+            try:
+                page_number = int(match.group(1))
+            except ValueError:
+                continue
+            start = match.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
+            page_text = self._format_quote_text(markdown[start:end])
+            if page_text:
+                pages.append((page_number, page_text))
+        return pages
+
     def _fallback_answer(self, matches: list[dict[str, Any]], ranked_sentences: list[dict[str, Any]]) -> dict[str, Any]:
         answer_sentences = [item["sentence"] for item in ranked_sentences[:3]]
         citations = []
         for item in ranked_sentences[:3]:
             metadata = item.get("metadata", {})
+            page_number = metadata.get("page_number") or self._lookup_page_number(
+                str(metadata.get("document_id", "")),
+                item["sentence"],
+                item.get("document", "") or "",
+            )
             citations.append(
                 {
                     "source_number": len(citations) + 1,
                     "source_name": metadata.get("source_name", ""),
                     "document_id": metadata.get("document_id", ""),
                     "section_hint": metadata.get("section_hint", ""),
-                    "page_number": metadata.get("page_number"),
+                    "page_number": page_number,
                     "chunk_index": metadata.get("chunk_index"),
                     "quote": self._format_quote_text(item.get("document", "") or item["sentence"]),
                     "highlight_text": self._format_quote_text(item["sentence"]),
@@ -345,15 +489,18 @@ class ChromaRetriever:
                     "source_name": metadata.get("source_name", ""),
                     "document_id": metadata.get("document_id", ""),
                     "section_hint": metadata.get("section_hint", ""),
-                    "page_number": metadata.get("page_number"),
+                    "page_number": metadata.get("page_number") or self._lookup_page_number(
+                        str(metadata.get("document_id", "")),
+                        answer_sentences[0],
+                        matches[0].get("document", "") or "",
+                    ),
                     "chunk_index": metadata.get("chunk_index"),
                     "quote": answer_sentences[0],
                     "highlight_text": answer_sentences[0],
                 }
             ]
-        inline_markers = " ".join(f"[{citation['source_number']}]" for citation in citations[:2])
         return {
-            "answer": f"{' '.join(answer_sentences)} {inline_markers}".strip(),
+            "answer": " ".join(answer_sentences).strip(),
             "citations": citations,
         }
 
@@ -421,6 +568,29 @@ class ChromaRetriever:
         for index, citation in enumerate(citations or [], start=1):
             source_number = int(citation.get("source_number") or index)
             evidence_item = evidence_by_number.get(source_number, {})
+            if evidence_item:
+                normalized.append(
+                    {
+                        "source_number": source_number,
+                        "source_name": evidence_item.get("source_name") or "",
+                        "document_id": evidence_item.get("document_id") or "",
+                        "section_hint": evidence_item.get("section_hint") or "",
+                        "quote": self._format_quote_text(
+                            evidence_item.get("excerpt") or citation.get("quote") or ""
+                        ),
+                        "highlight_text": self._best_highlight_for_chunk(
+                            query,
+                            citation.get("quote") or "",
+                            evidence_item.get("highlight_text") or "",
+                            evidence_item.get("excerpt") or "",
+                        ),
+                        "chunk_text": self._format_quote_text(evidence_item.get("excerpt") or ""),
+                        "chunk_index": evidence_item.get("chunk_index"),
+                        "page_number": evidence_item.get("page_number"),
+                        "chunk_strategy": evidence_item.get("chunk_strategy") or "",
+                    }
+                )
+                continue
             full_quote = self._format_quote_text(
                 evidence_item.get("excerpt") or citation.get("quote") or ""
             )
@@ -451,7 +621,13 @@ class ChromaRetriever:
                     "highlight_text": highlight_text,
                     "chunk_text": chunk_text,
                     "chunk_index": citation.get("chunk_index") if citation.get("chunk_index") is not None else resolved_metadata.get("chunk_index"),
-                    "page_number": citation.get("page_number") if citation.get("page_number") is not None else resolved_metadata.get("page_number"),
+                    "page_number": (
+                        evidence_item.get("page_number")
+                        if evidence_item.get("page_number") is not None
+                        else resolved_metadata.get("page_number")
+                        if resolved_metadata.get("page_number") is not None
+                        else citation.get("page_number")
+                    ),
                     "chunk_strategy": resolved_metadata.get("strategy") or "",
                 }
             )
@@ -511,57 +687,10 @@ class ChromaRetriever:
         if not normalized_citations:
             return re.sub(r"\s*\[(\d+)\]", "", text).strip()
 
-        raw_by_number: dict[int, dict[str, Any]] = {}
-        for index, citation in enumerate(raw_citations or [], start=1):
-            try:
-                source_number = int(citation.get("source_number") or index)
-            except (TypeError, ValueError):
-                source_number = index
-            raw_by_number[source_number] = citation
-
-        def _citation_identity(citation: dict[str, Any]) -> tuple[str, str, str, str, str]:
-            return (
-                str(citation.get("document_id") or ""),
-                str(citation.get("source_name") or ""),
-                str(citation.get("page_number") or ""),
-                str(citation.get("chunk_index") or ""),
-                self._format_quote_text(
-                    citation.get("chunk_text")
-                    or citation.get("quote")
-                    or citation.get("highlight_text")
-                    or ""
-                ),
-            )
-
-        normalized_number_by_identity = {
-            _citation_identity(citation): int(citation.get("source_number") or 0)
-            for citation in normalized_citations
-        }
-
-        def _replace(match: re.Match[str]) -> str:
-            try:
-                raw_number = int(match.group(1))
-            except (TypeError, ValueError):
-                return ""
-
-            raw_citation = raw_by_number.get(raw_number)
-            if not raw_citation:
-                return ""
-
-            identity = _citation_identity(raw_citation)
-            normalized_number = normalized_number_by_identity.get(identity)
-            if not normalized_number:
-                return ""
-            return f"[{normalized_number}]"
-
-        rewritten = re.sub(r"\[(\d+)\]", _replace, text)
-        rewritten = re.sub(r"(?:\[(\d+)\])(?:\s*\[\1\])+", r"[\1]", rewritten)
-        rewritten = re.sub(r"\s{2,}", " ", rewritten)
-        rewritten = rewritten.strip()
-        if not re.search(r"\[\d+\]", rewritten):
-            inline_markers = " ".join(f"[{int(citation.get('source_number') or 0)}]" for citation in normalized_citations if citation.get("source_number"))
-            if inline_markers:
-                rewritten = f"{rewritten} {inline_markers}".strip()
+        rewritten = re.sub(r"\s*\[(\d+)\]", "", text)
+        rewritten = re.sub(r"\n\s*\[[^\n\]]*:[^\n\]]*\]\s*$", "", rewritten)
+        rewritten = re.sub(r"\n\s*참조 문서:[^\n]*$", "", rewritten)
+        rewritten = re.sub(r"\s{2,}", " ", rewritten).strip()
         return rewritten
 
     def _build_document_summaries(self, matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -587,7 +716,38 @@ class ChromaRetriever:
         return summaries[:3]
 
     def _split_sentences(self, text: str) -> list[str]:
-        return [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", text) if part.strip()]
+        """문장 단위로 분리. 마크다운 표 블록은 행 단위로 쪼개지 않고 통째로 유지."""
+        results: list[str] = []
+        table_buffer: list[str] = []
+        non_table_buffer: list[str] = []
+
+        def _flush_table() -> None:
+            if table_buffer:
+                block = "\n".join(table_buffer).strip()
+                if block:
+                    results.append(block)
+                table_buffer.clear()
+
+        def _flush_non_table() -> None:
+            if non_table_buffer:
+                segment = "\n".join(non_table_buffer)
+                for part in re.split(r"(?<=[.!?])\s+|\n+", segment):
+                    part = part.strip()
+                    if part:
+                        results.append(part)
+                non_table_buffer.clear()
+
+        for line in text.splitlines():
+            if re.match(r"^\s*\|", line) or re.match(r"^\[표: \d+행 × \d+열\]$", line.strip()):
+                _flush_non_table()
+                table_buffer.append(line)
+            else:
+                _flush_table()
+                non_table_buffer.append(line)
+
+        _flush_table()
+        _flush_non_table()
+        return results
 
     def _tokens(self, text: str) -> set[str]:
         return set(re.findall(r"[0-9A-Za-z가-힣]+", text.lower()))

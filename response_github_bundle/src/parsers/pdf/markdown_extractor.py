@@ -675,11 +675,13 @@ class PdfMarkdownExtractor:
         for row in rows:
             normalized.append([(str(cell) if cell is not None else "").replace("\n", "<br>").strip() for cell in row] + [""] * (width - len(row)))
 
+        total_rows = len(normalized)
         header = normalized[0]
         separator = ["---"] * width
         body = normalized[1:] or [[""] * width]
         markdown_rows = [header, separator, *body]
-        return "\n".join("| " + " | ".join(row) + " |" for row in markdown_rows)
+        table_meta = f"[표: {total_rows}행 × {width}열]"
+        return table_meta + "\n" + "\n".join("| " + " | ".join(row) + " |" for row in markdown_rows)
 
     def _normalize_page_text(self, text: str) -> str:
         return text.replace("\r\n", "\n").replace("\r", "\n").strip()
