@@ -5,9 +5,10 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error, request as urllib_request
 
 from src.indexing.embedding_backends import EmbeddingBackend, load_openai_embedding_settings, normalize_model_token, resolve_embedding_backend
-from src.retrieval.document_summary import load_summary_map
+from src.retrieval.document_summary import build_page_summaries, extract_markdown_pages, load_summary_map
 from src.retrieval.openai_answerer import load_openai_settings
 from src.shared.retry import call_with_retry
 from src.shared.io import read_text_with_fallback
@@ -34,7 +35,24 @@ def _format_quote_text(text: str) -> str:
 
 
 def _tokenize_lookup_text(text: str) -> set[str]:
-    return {token for token in re.split(r"[^\w\uAC00-\uD7A3]+", str(text or "").lower()) if token}
+    normalized = str(text or "").lower()
+    basic_tokens = [token for token in re.split(r"[^\w\uAC00-\uD7A3]+", normalized) if token]
+    if not basic_tokens:
+        return set()
+
+    tokens = set(basic_tokens)
+    compact = re.sub(r"[^0-9a-zA-Z\uAC00-\uD7A3]+", "", normalized)
+    if compact and 2 <= len(compact) <= 24:
+        tokens.add(compact)
+
+    for left, right in zip(basic_tokens, basic_tokens[1:]):
+        if len(left) < 2 or len(right) < 2:
+            continue
+        combined = f"{left}{right}"
+        if len(combined) <= 24:
+            tokens.add(combined)
+
+    return tokens
 
 
 def _pick_highlight_text(query: str, text: str) -> str:
@@ -62,9 +80,58 @@ LANGCHAIN_SUMMARIZE_PROMPT = """당신은 한국어 문서를 빠르게 읽고 �
 규칙:
 - 요약은 문서에 실제로 있는 내용만 반영하세요.
 - 수치, 날짜, 기관명은 문서에 있을 때만 적으세요.
+- 문체는 자연스러운 한국어 설명문 스타일의 존댓말로 작성하세요.
+- 사람이나 기관을 높이는 표현인 "-하셨습니다", "-되셨습니다", "-이십니다"는 쓰지 마세요.
+- 문서, 보고서, 통계, 수치, 발행액, 잔액, 증감 같은 대상은 사람처럼 높이지 말고 "-입니다", "-합니다", "-했습니다", "-집계됐습니다", "-감소했습니다", "-증가했습니다"처럼 쓰세요.
+- 어색한 피동/높임 표현보다 간결한 서술형을 우선하세요.
+- 잘못된 예: "발행액은 감소하셨습니다.", "본 문서는 보도자료이십니다."
+- 올바른 예: "발행액은 감소했습니다.", "본 문서는 보도자료입니다."
 - JSON 외 다른 설명은 쓰지 마세요.
 
 문서 내용:
+{content}
+"""
+
+
+LANGCHAIN_PAGE_SUMMARIZE_PROMPT = """당신은 문서 분석 전문가입니다.
+
+아래 한 페이지 분량의 문서를 읽고 반드시 공손한 한국어 존댓말로 핵심만 정리해주세요.
+반드시 JSON만 반환하세요.
+{{"summary_text": "2-4문장 페이지 요약", "key_points": ["핵심 포인트 1", "핵심 포인트 2"]}}
+
+규칙:
+- 페이지에 실제로 있는 내용만 반영하세요.
+- 추측하거나 일반론을 덧붙이지 마세요.
+- 숫자, 날짜, 기관명은 페이지에 있을 때만 포함하세요.
+- 서술형 문장은 모두 자연스러운 설명문 스타일의 존댓말로 작성하세요.
+- 사람이나 기관을 높이는 표현인 "-하셨습니다", "-되셨습니다", "-이십니다"는 쓰지 마세요.
+- 문서, 통계, 수치, 항목, 발행액, 잔액, 증가/감소 대상에는 "-했습니다", "-집계됐습니다", "-나타났습니다", "-감소했습니다", "-증가했습니다"를 사용하세요.
+- 잘못된 예: "CP 잔액은 증가하셨습니다."
+- 올바른 예: "CP 잔액은 증가했습니다."
+
+페이지 번호: {page_number}
+페이지 내용:
+{content}
+"""
+
+
+LANGCHAIN_REDUCE_SUMMARIZE_PROMPT = """당신은 문서 분석 전문가입니다.
+
+아래는 문서의 페이지별 요약입니다. 이를 종합해 반드시 공손한 한국어 존댓말로 전체 문서 요약을 작성해주세요.
+반드시 JSON만 반환하세요.
+{{"summary_text": "4-7문장 전체 요약", "key_points": ["핵심 포인트 1", "핵심 포인트 2", "핵심 포인트 3"], "document_type": "문서 유형"}}
+
+규칙:
+- 페이지별 요약을 합쳐 전체 문서를 충실하게 설명하세요.
+- 중복 표현은 줄이고 중요한 흐름은 유지하세요.
+- 문서에 없는 사실은 추가하지 마세요.
+- 서술형 문장은 모두 자연스러운 설명문 스타일의 존댓말로 작성하세요.
+- 사람이나 기관을 높이는 표현인 "-하셨습니다", "-되셨습니다", "-이십니다"는 쓰지 마세요.
+- 문서, 보고서, 통계, 수치, 발행액, 잔액, 증감 같은 대상은 사람처럼 높이지 말고 "-입니다", "-합니다", "-했습니다", "-집계됐습니다", "-감소했습니다", "-증가했습니다"처럼 쓰세요.
+- 잘못된 예: "본 문서는 보도자료이십니다.", "회사채 잔액은 증가하셨습니다."
+- 올바른 예: "본 문서는 보도자료입니다.", "회사채 잔액은 증가했습니다."
+
+페이지별 요약:
 {content}
 """
 
@@ -79,7 +146,8 @@ Follow these rules strictly:
 - Do not guess missing numbers, dates, entities, or conclusions.
 - If the question is ambiguous, first say what is unclear, then provide only the limited facts that are explicitly supported.
 - If the context is insufficient, say exactly what is missing.
-- Write naturally in Korean and avoid boilerplate AI phrasing.
+- Write naturally in Korean honorific speech (존댓말) and avoid boilerplate AI phrasing.
+- Do not use human honorific predicates for documents, numbers, balances, statistics, or trends. Prefer "-입니다", "-했습니다", "-증가했습니다", "-감소했습니다".
 - Do not add inline citation markers like [1] or [2] in the answer text.
 
 Output format:
@@ -243,7 +311,7 @@ class LangChainRetrievalQAService:
                 continue
             try:
                 payload = json.loads(read_text_with_fallback(Path(target_path))[0])
-            except (UnicodeDecodeError, json.JSONDecodeError):
+            except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if payload.get("ui_summary"):
                 continue
@@ -255,7 +323,7 @@ class LangChainRetrievalQAService:
     def answer_question(
         self,
         query: str,
-        strategy: str = "rule_based",
+        strategy: str = "semantic",
         top_k: int = 4,
         *,
         document_id: str = "",
@@ -493,7 +561,7 @@ class LangChainRetrievalQAService:
             for path in sorted(root.glob("*.json")):
                 try:
                     payload = json.loads(read_text_with_fallback(path)[0])
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
                     continue
                 source_name = str(payload.get("source_name") or "")
                 document_id = str(payload.get("document_id") or "")
@@ -545,35 +613,34 @@ class LangChainRetrievalQAService:
 
         try:
             payload = json.loads(read_text_with_fallback(Path(target_path))[0])
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
             return {"error": "document_json_invalid", "document_id": record["document_id"]}
+
+        if not payload.get("page_summaries"):
+            payload["page_summaries"] = build_page_summaries(payload)
 
         # Return cached UI summary if already generated
         if payload.get("ui_summary"):
             cached_ui_summary = dict(payload["ui_summary"])
-            cached_ui_summary.setdefault("summary_elapsed_seconds", 0.0)
-            cached_ui_summary.setdefault("summary_cached", True)
-            cached_ui_summary.setdefault("summary_source", "cached_ui_summary")
-            return cached_ui_summary
-        if payload.get("llm_summary"):
-            llm_summary = payload["llm_summary"]
-            return {
-                "document_id": record["document_id"],
-                "source_name": record["source_name"],
-                "summary_text": llm_summary.get("summary_text", ""),
-                "key_points": llm_summary.get("key_points") or llm_summary.get("highlights") or [],
-                "document_type": llm_summary.get("document_type", ""),
-                "used_model": llm_summary.get("used_model") or "cached_llm_summary",
-                "framework": llm_summary.get("framework") or "pipeline_llm_summary",
-                "summary_elapsed_seconds": 0.0,
-                "summary_cached": True,
-                "summary_source": "pipeline_llm_summary",
-            }
-
+            cached_page_summaries = self._normalize_page_summaries(
+                cached_ui_summary.get("page_summaries") or payload.get("page_summaries")
+            )
+            page_sources = {str(item.get("summary_source") or "") for item in cached_page_summaries}
+            has_only_llm_pages = bool(cached_page_summaries) and all(source == "on_demand_page_llm" for source in page_sources)
+            if has_only_llm_pages:
+                cached_ui_summary.setdefault("summary_elapsed_seconds", 0.0)
+                cached_ui_summary.setdefault("summary_cached", True)
+                cached_ui_summary.setdefault("summary_source", "cached_ui_summary")
+                cached_ui_summary["page_summaries"] = cached_page_summaries
+                return cached_ui_summary
         markdown = str(payload.get("markdown") or "")
         if not markdown.strip():
             return {"error": "document_has_no_content", "document_id": record["document_id"]}
-        basic_summary = payload.get("basic_summary") or self.summary_map.get(record["document_id"], {})
+        basic_summary = (
+            payload.get("llm_summary")
+            or payload.get("basic_summary")
+            or self.summary_map.get(record["document_id"], {})
+        )
         document_type = str(
             (payload.get("classification") or {}).get("document_type")
             or payload.get("extension")
@@ -597,17 +664,26 @@ class LangChainRetrievalQAService:
                 "summary_elapsed_seconds": 0.0,
                 "summary_cached": False,
                 "summary_source": "basic_summary_fallback",
+                "page_summaries": self._normalize_page_summaries(payload.get("page_summaries")),
             }
 
         summarize_started = time.perf_counter()
+        page_summaries = self._normalize_page_summaries(payload.get("page_summaries"))
         try:
-            prompt_text = LANGCHAIN_SUMMARIZE_PROMPT.format(content=markdown)
-            response = call_with_retry(
-                lambda: self._get_chat_llm().invoke(prompt_text),
-                context="LangChain.summarize_document",
+            page_summaries = self._summarize_pages_with_llm(payload)
+            combined_page_summaries = "\n\n".join(
+                [
+                    f"[Page {item['page_number']}]\n{item['summary_text']}\n"
+                    + "\n".join(f"- {point}" for point in item.get("key_points", []))
+                    for item in page_summaries
+                ]
+            ).strip()
+            prompt_text = (
+                LANGCHAIN_REDUCE_SUMMARIZE_PROMPT.format(content=combined_page_summaries)
+                if combined_page_summaries
+                else LANGCHAIN_SUMMARIZE_PROMPT.format(content=markdown)
             )
-            result_text = response.content if hasattr(response, "content") else str(response)
-
+            result_text = self._invoke_summary_model(prompt_text)
             result = _parse_llm_summary_response(result_text)
         except Exception as error:
             return {
@@ -622,6 +698,7 @@ class LangChainRetrievalQAService:
                 "summary_elapsed_seconds": round(time.perf_counter() - summarize_started, 3),
                 "summary_cached": False,
                 "summary_source": "basic_summary_fallback",
+                "page_summaries": self._normalize_page_summaries(payload.get("page_summaries")),
             }
 
         # Strip any key_points element that is a stray "document_type: ..." string
@@ -649,19 +726,90 @@ class LangChainRetrievalQAService:
             "summary_elapsed_seconds": round(time.perf_counter() - summarize_started, 3),
             "summary_cached": False,
             "summary_source": "on_demand_llm",
+            "page_summaries": self._normalize_page_summaries(page_summaries),
         }
 
         # Persist to JSON so future calls skip LLM
         try:
             cached = json.loads(read_text_with_fallback(Path(target_path))[0])
             cached["ui_summary"] = ui_summary
+            cached["page_summaries"] = self._normalize_page_summaries(page_summaries)
             Path(target_path).write_text(
                 json.dumps(cached, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
-        except Exception:
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
             pass
 
         return ui_summary
+
+    def _summarize_pages_with_llm(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        existing = self._normalize_page_summaries(payload.get("page_summaries"))
+        markdown_pages = extract_markdown_pages(str(payload.get("markdown") or ""))
+        if not markdown_pages:
+            return existing
+
+        cached_by_page = {int(item.get("page_number") or 0): item for item in existing}
+        page_summaries: list[dict[str, Any]] = []
+        for page in markdown_pages:
+            page_number = int(page.get("page_number") or 0)
+            page_text = str(page.get("text") or "").strip()
+            if page_number <= 0 or not page_text:
+                continue
+
+            cached_page = cached_by_page.get(page_number)
+            if cached_page and str(cached_page.get("summary_source") or "").startswith("on_demand"):
+                page_summaries.append(cached_page)
+                continue
+
+            prompt_text = LANGCHAIN_PAGE_SUMMARIZE_PROMPT.format(
+                page_number=page_number,
+                content=page_text[:5000],
+            )
+            result_text = self._invoke_summary_model(prompt_text)
+            result = _parse_llm_summary_response(result_text)
+            page_summaries.append(
+                {
+                    "page_number": page_number,
+                    "summary_text": str(result.get("summary_text", "")).strip() or str((cached_page or {}).get("summary_text") or "").strip(),
+                    "key_points": [
+                        str(item).strip()
+                        for item in (result.get("key_points") or (cached_page or {}).get("key_points") or [])
+                        if str(item).strip()
+                    ][:4],
+                    "char_count": len(page_text),
+                    "summary_source": "on_demand_page_llm",
+                }
+            )
+
+        return self._normalize_page_summaries(page_summaries or existing)
+
+    def _normalize_page_summaries(self, raw_page_summaries: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_page_summaries, list):
+            return []
+
+        normalized: list[dict[str, Any]] = []
+        for item in raw_page_summaries:
+            if not isinstance(item, dict):
+                continue
+            try:
+                page_number = int(item.get("page_number") or 0)
+            except (TypeError, ValueError):
+                page_number = 0
+            summary_text = str(item.get("summary_text") or "").strip()
+            if page_number <= 0 or not summary_text:
+                continue
+            normalized.append(
+                {
+                    "page_number": page_number,
+                    "summary_text": summary_text,
+                    "key_points": [str(point).strip() for point in (item.get("key_points") or []) if str(point).strip()][:4],
+                    "char_count": int(item.get("char_count") or 0),
+                    "summary_source": str(item.get("summary_source") or ""),
+                }
+            )
+
+        normalized.sort(key=lambda item: item["page_number"])
+        return normalized
 
     def _resolve_explicit_target(self, *, document_id: str, source_name: str) -> dict[str, Any] | None:
         if document_id:
@@ -684,6 +832,49 @@ class LangChainRetrievalQAService:
                 raise RuntimeError("OpenAI chat model is unavailable")
             self._chat_llm = ChatOpenAI(model=self.answer_model, temperature=0, api_key=self.api_key)
         return self._chat_llm
+
+    def _invoke_summary_model(self, prompt_text: str) -> str:
+        if not self.api_key or not self.answer_model:
+            raise RuntimeError("OpenAI chat model is unavailable")
+
+        body = json.dumps(
+            {
+                "model": self.answer_model,
+                "input": prompt_text,
+                "reasoning": {"effort": "low"},
+                "text": {"verbosity": "low"},
+            }
+        ).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        def _do_request() -> str:
+            req = urllib_request.Request(
+                "https://api.openai.com/v1/responses",
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+            opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+            try:
+                with opener.open(req, timeout=90) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except urllib_error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                exc.reason = f"OpenAI API error: {exc.code} {detail}"
+                raise
+
+            for item in payload.get("output", []):
+                for content in item.get("content", []):
+                    if content.get("type") == "output_text" and content.get("text"):
+                        return str(content["text"]).strip()
+            if payload.get("output_text"):
+                return str(payload["output_text"]).strip()
+            raise RuntimeError("OpenAI response did not include output text")
+
+        return call_with_retry(_do_request, context="LangChainRetrievalQAService.summary")
 
     def _structured_document_roots(self) -> list[Path]:
         roots = [self.project_root / "data" / "structured" / "documents"]
@@ -731,7 +922,7 @@ class LangChainRetrievalQAService:
             for path in root.glob("*.json"):
                 try:
                     payload = json.loads(read_text_with_fallback(path)[0])
-                except Exception:
+                except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
                     continue
                 if str(payload.get("document_id", "")) != document_id:
                     continue

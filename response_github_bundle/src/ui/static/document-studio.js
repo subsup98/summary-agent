@@ -26,6 +26,18 @@
     sourceHighlight: null,
   };
 
+  function isLlmSummaryPayload(summary) {
+    if (!summary || typeof summary !== "object") return false;
+    const source = String(summary.summary_source || "");
+    if (["on_demand_llm", "cached_ui_summary", "pipeline_llm_summary"].includes(source)) return true;
+    const usedModel = String(summary.used_model || "");
+    return Boolean(usedModel && !["cached_basic_summary", "cached_llm_summary"].includes(usedModel));
+  }
+
+  function hasLlmPageSummaries(items) {
+    return Array.isArray(items) && items.length > 0 && items.every((item) => String(item?.summary_source || "") === "on_demand_page_llm");
+  }
+
   const body = document.body;
   const appShell = document.querySelector(".app-shell");
   const qaCaption = document.getElementById("qa-caption");
@@ -45,6 +57,7 @@
   const sourceDetailMeta = document.getElementById("source-detail-meta");
   const sourceDetailOriginal = document.getElementById("source-detail-original");
   const sourceDetailContent = document.getElementById("source-detail-content");
+  const sourcePageSummaryList = document.getElementById("source-page-summary-list");
 
   const summaryContent = document.getElementById("summary-content");
   const downloadMdButton = document.getElementById("download-md-button");
@@ -67,7 +80,7 @@
   const backgroundWarmQueue = [];
   const backgroundWarmQueued = new Set();
   let backgroundWarmActive = 0;
-  const BACKGROUND_WARM_CONCURRENCY = 2;
+  const BACKGROUND_WARM_CONCURRENCY = 1;
 
   if (qaCaption) {
     qaCaption.textContent = initialStatus.qa_caption || "";
@@ -106,7 +119,7 @@
     citations.forEach((citation) => {
       const sourceName = String(citation?.source_name || citation?.document_id || "").trim();
       const rawPageNumber = Number(citation?.page_number);
-      const pageNumber = Number.isFinite(rawPageNumber) ? Math.max(1, rawPageNumber - 1) : null;
+      const pageNumber = Number.isFinite(rawPageNumber) && rawPageNumber > 0 ? rawPageNumber : null;
       if (!sourceName) return;
       const label = pageNumber ? `${sourceName} p.${pageNumber}` : sourceName;
       if (seen.has(label)) return;
@@ -114,6 +127,138 @@
       labels.push(label);
     });
     return labels.length ? `참조: ${labels.join(", ")}` : "";
+  }
+
+  function buildCitationMeta(citation) {
+    const parts = [];
+    const sourceName = String(citation?.source_name || citation?.document_id || "").trim();
+    const sectionHint = String(citation?.section_hint || "").trim();
+    const pageNumber = Number(citation?.page_number);
+    if (sourceName) parts.push(sourceName);
+    if (Number.isFinite(pageNumber) && pageNumber > 0) parts.push(`p.${pageNumber}`);
+    if (sectionHint && !["none", "null", "undefined"].includes(sectionHint.toLowerCase())) parts.push(sectionHint);
+    return parts.join(" · ");
+  }
+
+  function buildSupportingAssetMeta(asset) {
+    const parts = [];
+    const pageNumber = Number(asset?.page_number);
+    if (Number.isFinite(pageNumber) && pageNumber > 0) {
+      parts.push(`p.${pageNumber}`);
+    }
+    if (String(asset?.type || "") === "table") {
+      const rowCount = Number(asset?.row_count);
+      const columnCount = Number(asset?.column_count);
+      if (Number.isFinite(rowCount) && rowCount > 0 && Number.isFinite(columnCount) && columnCount > 0) {
+        parts.push(`${rowCount}행 x ${columnCount}열`);
+      }
+    }
+    return parts.join(" · ");
+  }
+
+  function normalizeAssetMarkdown(markdown) {
+    const lines = String(markdown || "")
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter(Boolean);
+    return lines.slice(0, 6).join("\n");
+  }
+
+  function renderSupportingAssetCard(asset, turnIndex, citationIndex, assetIndex) {
+    const assetType = String(asset?.type || "");
+    const assetLabel = assetType === "table"
+      ? "표 근거"
+      : assetType === "page_region"
+        ? "페이지 근거"
+        : "이미지 근거";
+    const title = String(asset?.title || assetLabel).trim();
+    const meta = buildSupportingAssetMeta(asset);
+    const previewUrl = String(asset?.preview_url || "").trim();
+    const previewMarkdown = assetType === "table" ? "" : "";
+    const previewText = assetType === "table" ? "" : String(asset?.caption_text || asset?.text || "").trim();
+
+    return `
+      <div
+        class="supporting-asset-card"
+        role="button"
+        tabindex="0"
+        data-turn-index="${turnIndex}"
+        data-citation-index="${citationIndex}"
+        data-asset-index="${assetIndex}"
+      >
+        <div class="supporting-asset-head">
+          <div class="supporting-asset-title-wrap">
+            <span class="supporting-asset-kicker">${esc(assetLabel)}</span>
+            <strong>${esc(title)}</strong>
+          </div>
+          ${meta ? `<span class="supporting-asset-meta">${esc(meta)}</span>` : ""}
+        </div>
+        ${previewUrl ? `
+          <div class="supporting-asset-preview">
+            <img src="${esc(previewUrl)}" alt="${esc(title)}" loading="lazy">
+          </div>
+        ` : ""}
+        ${previewMarkdown
+          ? `<div class="supporting-asset-body markdown-body">${renderMarkdown(previewMarkdown)}</div>`
+          : previewText
+            ? `<div class="supporting-asset-body">${esc(previewText)}</div>`
+            : ""}
+      </div>
+    `;
+  }
+
+  function buildCitationPreviewText(citation) {
+    const candidates = [
+      citation?.highlight_text,
+      citation?.quote,
+      citation?.chunk_text,
+    ].map((item) => String(item || "").trim()).filter(Boolean);
+    const preview = candidates[0] || "근거 미리보기가 없습니다.";
+    return preview.length > 320 ? `${preview.slice(0, 317).trimEnd()}...` : preview;
+  }
+
+  function renderCitationCard(citation, turnIndex, citationIndex) {
+    const meta = buildCitationMeta(citation);
+    const previewText = buildCitationPreviewText(citation);
+    const supportingAssets = Array.isArray(citation?.supporting_assets) ? citation.supporting_assets : [];
+    const hasCitationText = Boolean(previewText && previewText !== "근거 미리보기가 없습니다.");
+    if (!supportingAssets.length && !hasCitationText) {
+      return "";
+    }
+
+    return `
+      <section class="answer-evidence-block">
+        ${hasCitationText
+          ? `<div class="answer-evidence-tools">
+              <button
+                type="button"
+                class="citation-text-toggle"
+                aria-expanded="false"
+                data-turn-index="${turnIndex}"
+                data-citation-toggle-index="${citationIndex}"
+              >텍스트 근거 보기</button>
+            </div>`
+          : ""}
+        ${hasCitationText
+          ? `<div class="citation-text-panel" hidden>
+              ${meta ? `<div class="citation-text-meta">${esc(meta)}</div>` : ""}
+              <div class="citation-text-body">${esc(previewText)}</div>
+            </div>`
+          : ""}
+        <div class="supporting-asset-list">
+          ${supportingAssets.map((asset, assetIndex) => renderSupportingAssetCard(asset, turnIndex, citationIndex, assetIndex)).join("")}
+        </div>
+      </section>
+    `;
+  }
+
+  function bindInteractiveCard(node, onActivate) {
+    node.addEventListener("click", onActivate);
+    node.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      onActivate();
+    });
   }
 
   function getSelectedDocument() {
@@ -135,34 +280,53 @@
     return state.chatHistory;
   }
 
+  function normalizeSummaryPayload(selected, summary) {
+    return {
+      document_id: selected.document_id,
+      source_name: selected.source_name,
+      document_type: selected.document_type || selected.extension || "document",
+      summary_text: summary?.summary_text || "",
+      key_points: summary?.key_points || summary?.highlights || [],
+      page_summaries: hasLlmPageSummaries(summary?.page_summaries) ? summary.page_summaries : [],
+      summary_source: summary?.summary_source || "basic_summary",
+      used_model: summary?.used_model || "",
+      warning: summary?.warning || "",
+    };
+  }
+
   function getSummaryPayload(documentId) {
     if (!documentId) return null;
     const selected = state.documents.find((item) => item.document_id === documentId);
     if (!selected) return null;
 
     const cached = state.summaryCache[documentId];
-    if (cached) return cached;
+    if (isLlmSummaryPayload(cached)) return cached;
 
-    const summary = selected.ui_summary || selected.llm_summary || selected.basic_summary || null;
+    const summary = [selected.ui_summary, selected.llm_summary].find((item) => isLlmSummaryPayload(item)) || null;
     if (!summary) return null;
 
-    return {
-      document_id: selected.document_id,
-      source_name: selected.source_name,
-      document_type: selected.document_type || selected.extension || "document",
-      summary_text: summary.summary_text || "",
-      key_points: summary.key_points || summary.highlights || [],
-      summary_source: summary.summary_source || "basic_summary",
-    };
+    return normalizeSummaryPayload(selected, summary);
+  }
+
+  function getSummaryStatusMessage(documentId) {
+    const ready = getSummaryPayload(documentId);
+    if (ready?.summary_text) return ready.summary_text;
+    if (state.summaryInflight[documentId]) {
+      return "LLM 요약을 생성 중입니다. 문서 길이에 따라 1~2분 정도 걸릴 수 있습니다.";
+    }
+    const attempted = state.summaryCache[documentId];
+    if (attempted?.warning) {
+      return "LLM 요약을 아직 완료하지 못했습니다. 잠시 후 다시 시도해주세요.";
+    }
+    return "LLM 요약을 준비 중입니다.";
   }
 
   function buildStarterSummaryHtml() {
     const selected = state.documents.find((item) => item.document_id === state.starterDocumentId) || getSelectedDocument();
     if (!selected) return "";
 
-    const payload = getSummaryPayload(selected.document_id);
     const title = selected.source_name || selected.document_id || "문서";
-    const summaryText = payload?.summary_text || "문서 요약을 불러오는 중입니다.";
+    const summaryText = getSummaryStatusMessage(selected.document_id);
 
     return `
       <section class="chat-starter-card chat-empty-state">
@@ -265,8 +429,9 @@
     const selected = getSelectedDocument();
     if (!selected) return;
 
-    const cached = state.summaryCache[selected.document_id];
-    if (!cached || cached.summary_source === "basic_summary_fallback") {
+    const readySummary = getSummaryPayload(selected.document_id);
+    const attempted = state.summaryCache[selected.document_id];
+    if (!readySummary && !attempted?.warning) {
       void autoSummarizeDocument(selected.document_id);
     }
   }
@@ -279,7 +444,10 @@
   async function autoSummarizeDocument(documentId, options = {}) {
     const force = Boolean(options.force);
     if (state.summaryInflight[documentId]) return;
-    if (!force && state.summaryCache[documentId]) return;
+    if (!force) {
+      const cached = state.summaryCache[documentId];
+      if (isLlmSummaryPayload(cached) || cached?.warning) return;
+    }
 
     const doc = state.documents.find((item) => item.document_id === documentId);
     if (!doc) return;
@@ -294,18 +462,24 @@
           source_name: doc.source_name,
         }),
       });
-      const payload = await response.json();
-      if (response.ok) {
-        state.summaryCache[documentId] = payload;
-        if (state.selectedDocumentId === documentId) {
-          renderChat();
-        }
-        if (state.sourceViewerDocumentId === documentId) {
-          renderSourceViewer();
-        }
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && isLlmSummaryPayload(payload)) {
+        state.summaryCache[documentId] = normalizeSummaryPayload(doc, payload || {});
+        doc.ui_summary = payload;
+      } else {
+        state.summaryCache[documentId] = normalizeSummaryPayload(doc, {
+          summary_source: payload?.summary_source || "llm_summary_unavailable",
+          warning: String(payload?.warning || payload?.error || "LLM 요약을 완료하지 못했습니다."),
+        });
       }
     } finally {
       delete state.summaryInflight[documentId];
+      if (state.selectedDocumentId === documentId) {
+        renderChat();
+      }
+      if (state.sourceViewerDocumentId === documentId) {
+        renderSourceViewer();
+      }
     }
   }
 
@@ -371,7 +545,6 @@
     await Promise.allSettled([
       autoSummarizeDocument(documentId),
       fetchDocumentContent(documentId),
-      prefetchOriginalDocument(documentId),
     ]);
   }
 
@@ -480,9 +653,54 @@
     if (!originalUrl) {
       return '<div class="source-original-fallback">문서 원본을 불러올 수 없습니다.</div>';
     }
+    if (content.original_preview_kind === "image") {
+      return `<img class="source-original-image" src="${esc(originalUrl)}" alt="${esc(content.source_name || "원본 문서 미리보기")}">`;
+    }
     const pageNumber = state.sourceHighlight?.page_number;
     const pageHash = pageNumber ? `#page=${pageNumber}&toolbar=0&navpanes=0` : "#toolbar=0&navpanes=0";
     return `<iframe class="source-original-embed" src="${esc(originalUrl)}${pageHash}"></iframe>`;
+  }
+
+  function renderPageSummaryList(content, summary, documentId = "") {
+    const pageSummaries = Array.isArray(summary?.page_summaries) ? summary.page_summaries : [];
+
+    if (!sourcePageSummaryList) return;
+    if (!pageSummaries.length) {
+      sourcePageSummaryList.innerHTML = state.summaryInflight[documentId]
+        ? '<div class="muted">페이지별 LLM 요약을 생성 중입니다.</div>'
+        : '<div class="muted">페이지별 LLM 요약이 아직 준비되지 않았습니다.</div>';
+      return;
+    }
+
+    sourcePageSummaryList.innerHTML = pageSummaries.map((item) => {
+      const pageNumber = Number(item?.page_number) || 0;
+      const keyPoints = Array.isArray(item?.key_points) ? item.key_points.filter(Boolean).slice(0, 3) : [];
+      return `
+        <button class="source-page-summary-item" type="button" data-page-number="${esc(pageNumber)}">
+          <div class="source-page-summary-head">
+            <span class="source-page-summary-number">p.${esc(pageNumber)}</span>
+            <span class="source-page-summary-source">${esc(item?.summary_source || "")}</span>
+          </div>
+          <p class="source-page-summary-text">${esc(item?.summary_text || "")}</p>
+          ${keyPoints.length
+            ? `<div class="source-page-summary-points">${keyPoints.map((point) => `<span class="source-page-summary-point">${esc(point)}</span>`).join("")}</div>`
+            : ""}
+        </button>
+      `;
+    }).join("");
+
+    sourcePageSummaryList.querySelectorAll("[data-page-number]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const pageNumber = Number(button.getAttribute("data-page-number") || 0);
+        if (!pageNumber) return;
+        state.sourceHighlight = {
+          page_number: pageNumber,
+          highlight_text: "",
+          block_text: "",
+        };
+        renderSourceViewer();
+      });
+    });
   }
 
   function renderSourceViewer() {
@@ -503,11 +721,11 @@
 
     const selected = state.documents.find((doc) => doc.document_id === documentId) || {};
     const content = state.sourceContentCache[documentId] || {};
-    const summary = state.summaryCache[documentId] || {};
+    const summary = getSummaryPayload(documentId) || {};
 
     sourceDetailTitle.textContent = selected.source_name || selected.document_id || "문서";
     sourceDetailName.textContent = selected.source_name || selected.document_id || "문서";
-    sourceDetailSummary.textContent = summary.summary_text || content.summary_text || "요약이 아직 준비되지 않았습니다.";
+    sourceDetailSummary.textContent = getSummaryStatusMessage(documentId);
     sourceDetailMeta.textContent = [
       content.document_type || selected.document_type,
       selected.origin,
@@ -519,9 +737,11 @@
     if (!content.original_url && !content.markdown) {
       sourceDetailOriginal.innerHTML = '<div class="source-original-fallback">문서를 불러오는 중입니다.</div>';
       sourceDetailContent.innerHTML = '<div class="muted">파싱 결과를 불러오는 중입니다.</div>';
+      renderPageSummaryList(content, summary, documentId);
       return;
     }
 
+    renderPageSummaryList(content, summary, documentId);
     sourceDetailOriginal.innerHTML = renderOriginalPreview(content);
     sourceDetailContent.innerHTML = formatMarkdownForViewer(
       content.markdown || "",
@@ -568,6 +788,17 @@
       page_number: citation.page_number || null,
       highlight_text: citation.highlight_text || citation.quote || "",
       block_text: citation.chunk_text || citation.quote || citation.highlight_text || "",
+    };
+    await openSourceViewer(documentId, { syncSelection: false });
+  }
+
+  async function focusSupportingAsset(citation, asset) {
+    const documentId = citation?.document_id || state.selectedDocumentId;
+    if (!documentId) return;
+    state.sourceHighlight = {
+      page_number: asset?.page_number || citation?.page_number || null,
+      highlight_text: asset?.caption_text || asset?.text || citation?.highlight_text || citation?.quote || "",
+      block_text: asset?.markdown || asset?.text || asset?.caption_text || citation?.chunk_text || citation?.quote || "",
     };
     await openSourceViewer(documentId, { syncSelection: false });
   }
@@ -663,16 +894,24 @@
     updateSelectAllCheckbox();
   }
 
-  function renderAnswerBubble(result) {
+  function renderAnswerBubble(result, turnIndex) {
     const isError = Boolean(result.error);
-    const citationSummary = buildCitationSummary(result);
+    const citations = Array.isArray(result?.citations) ? result.citations : [];
+    const evidenceMarkup = citations
+      .map((citation, citationIndex) => renderCitationCard(citation, turnIndex, citationIndex))
+      .filter(Boolean)
+      .join("");
     return `
       <div class="chat-answer-card">
         <div class="chat-answer-head">
           <h3>답변</h3>
         </div>
         <div class="chat-answer-text markdown-body">${renderMarkdown(result.answer || (isError ? `오류: ${String(result.error || "unknown_error")}` : "응답이 없습니다."))}</div>
-        ${citationSummary ? `<div class="chat-answer-reference">${esc(citationSummary)}</div>` : ""}
+        ${evidenceMarkup
+          ? `<div class="answer-evidence-list">
+              ${evidenceMarkup}
+            </div>`
+          : ""}
       </div>
     `;
   }
@@ -685,10 +924,10 @@
       return;
     }
 
-    chatHistoryEl.innerHTML = starterHtml + history.map((entry) => {
+    chatHistoryEl.innerHTML = starterHtml + history.map((entry, turnIndex) => {
       const aiHtml = entry.loading
         ? '<div class="chat-loading">답변을 생성하는 중입니다...</div>'
-        : renderAnswerBubble(entry.result || {});
+        : renderAnswerBubble(entry.result || {}, turnIndex);
 
       return `
         <div class="chat-turn">
@@ -697,6 +936,43 @@
         </div>
       `;
     }).join("");
+
+    chatHistoryEl.querySelectorAll("[data-citation-index]:not([data-asset-index])").forEach((card) => {
+      const turnIndex = Number(card.getAttribute("data-turn-index") || -1);
+      const citationIndex = Number(card.getAttribute("data-citation-index") || -1);
+      bindInteractiveCard(card, () => {
+        const citation = history[turnIndex]?.result?.citations?.[citationIndex];
+        if (citation) {
+          void focusCitation(citation);
+        }
+      });
+    });
+
+    chatHistoryEl.querySelectorAll("[data-asset-index]").forEach((card) => {
+      const turnIndex = Number(card.getAttribute("data-turn-index") || -1);
+      const citationIndex = Number(card.getAttribute("data-citation-index") || -1);
+      const assetIndex = Number(card.getAttribute("data-asset-index") || -1);
+      bindInteractiveCard(card, () => {
+        const citation = history[turnIndex]?.result?.citations?.[citationIndex];
+        const asset = citation?.supporting_assets?.[assetIndex];
+        if (citation && asset) {
+          void focusSupportingAsset(citation, asset);
+        }
+      });
+    });
+
+    chatHistoryEl.querySelectorAll("[data-citation-toggle-index]").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const panel = button.closest(".answer-evidence-block")?.querySelector(".citation-text-panel");
+        if (!panel) return;
+        const expanded = button.getAttribute("aria-expanded") === "true";
+        button.setAttribute("aria-expanded", expanded ? "false" : "true");
+        button.textContent = expanded ? "텍스트 근거 보기" : "텍스트 근거 숨기기";
+        panel.hidden = expanded;
+      });
+    });
 
     if (scrollToBottom) {
       requestAnimationFrame(() => {
@@ -713,16 +989,10 @@
     reconcileUploadJobsWithDocuments();
 
     state.documents.forEach((doc) => {
-      const llmCached = doc.ui_summary || doc.llm_summary;
-      if (!llmCached || !doc.document_id) return;
-      state.summaryCache[doc.document_id] = {
-        document_id: doc.document_id,
-        source_name: doc.source_name,
-        document_type: doc.document_type || doc.extension || "document",
-        summary_text: llmCached.summary_text || "",
-        key_points: llmCached.key_points || llmCached.highlights || [],
-        summary_source: llmCached.summary_source || "",
-      };
+      if (!doc.document_id) return;
+      const cachedSummary = [doc.ui_summary, doc.llm_summary].find((item) => isLlmSummaryPayload(item)) || null;
+      if (!cachedSummary) return;
+      state.summaryCache[doc.document_id] = normalizeSummaryPayload(doc, cachedSummary);
     });
 
     if (!state.documents.length) {
@@ -762,7 +1032,9 @@
       renderDocumentPlaceholder();
     }
     renderChat();
-    scheduleBackgroundWarmup(state.documents.map((doc) => doc.document_id));
+    scheduleBackgroundWarmup(
+      [state.selectedDocumentId].filter(Boolean)
+    );
   }
 
   async function pollJob(jobId) {
@@ -804,6 +1076,9 @@
             }
           : null;
         await loadDocuments(batchDocIds[0] || state.selectedDocumentId || "");
+        if (batchDocIds.length) {
+          scheduleBackgroundWarmup(batchDocIds);
+        }
         renderUploadNotice();
         return;
       }
@@ -1035,7 +1310,14 @@
 
   const evtSource = new EventSource("/api/events");
   evtSource.addEventListener("documents_updated", async () => {
+    const previousIds = new Set(state.documents.map((doc) => doc.document_id));
     await loadDocuments(state.selectedDocumentId || "", { skipSummary: false });
+    const newDocumentIds = state.documents
+      .filter((doc) => !previousIds.has(doc.document_id))
+      .map((doc) => doc.document_id);
+    if (newDocumentIds.length) {
+      scheduleBackgroundWarmup(newDocumentIds);
+    }
   });
 
   window.documentStudio = {

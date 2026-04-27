@@ -25,6 +25,11 @@ JSON 형식으로만 답변하세요:
 규칙:
 - 문서에 실제로 있는 내용만 반영하세요.
 - 수치, 날짜, 기관명은 문서에 있을 때만 적으세요.
+- 문체는 자연스러운 한국어 설명문 스타일의 존댓말로 작성하세요.
+- 사람이나 기관을 높이는 표현인 "-하셨습니다", "-되셨습니다", "-이십니다"는 쓰지 마세요.
+- 문서, 보고서, 통계, 수치, 발행액, 잔액, 증감 같은 대상은 사람처럼 높이지 말고 "-입니다", "-합니다", "-했습니다", "-집계됐습니다", "-감소했습니다", "-증가했습니다"처럼 쓰세요.
+- 잘못된 예: "잔액은 감소하셨습니다."
+- 올바른 예: "잔액은 감소했습니다."
 - JSON 외 다른 설명은 쓰지 마세요.
 
 문서 일부:
@@ -40,6 +45,11 @@ JSON 형식으로만 답변하세요:
 
 규칙:
 - 각 부분의 내용을 종합하되 중복은 제거하세요.
+- 문체는 자연스러운 한국어 설명문 스타일의 존댓말로 작성하세요.
+- 사람이나 기관을 높이는 표현인 "-하셨습니다", "-되셨습니다", "-이십니다"는 쓰지 마세요.
+- 문서, 보고서, 통계, 수치, 발행액, 잔액, 증감 같은 대상은 사람처럼 높이지 말고 "-입니다", "-합니다", "-했습니다", "-집계됐습니다", "-감소했습니다", "-증가했습니다"처럼 쓰세요.
+- 잘못된 예: "본 문서는 보도자료이십니다."
+- 올바른 예: "본 문서는 보도자료입니다."
 - JSON 외 다른 설명은 쓰지 마세요.
 
 각 부분 요약:
@@ -49,9 +59,15 @@ JSON 형식으로만 답변하세요:
 # 이 글자 수 이하면 청킹 없이 전체를 한 번에 LLM에 전달
 _STUFF_THRESHOLD = 12_000
 
+PAGE_HEADING_RE = re.compile(r"(?im)^#\s*Page\s+(\d+)\s*$")
+
 def ensure_basic_summary(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("basic_summary"):
+        if not payload.get("page_summaries"):
+            payload["page_summaries"] = build_page_summaries(payload)
         return payload
+    if not payload.get("page_summaries"):
+        payload["page_summaries"] = build_page_summaries(payload)
     payload["basic_summary"] = build_basic_summary(payload)
     return payload
 
@@ -130,12 +146,74 @@ def build_basic_summary(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_page_summaries(payload: dict[str, Any], *, max_pages: int | None = None) -> list[dict[str, Any]]:
+    markdown = str(payload.get("markdown") or "")
+    if not markdown.strip():
+        return []
+
+    pages = extract_markdown_pages(markdown)
+    if max_pages is not None:
+        pages = pages[:max_pages]
+
+    page_summaries: list[dict[str, Any]] = []
+    for page in pages:
+        page_number = int(page.get("page_number") or 0)
+        page_text = str(page.get("text") or "").strip()
+        if page_number <= 0 or not page_text:
+            continue
+        sentences = _extract_candidate_sentences(page_text)
+        summary_text = " ".join(sentences[:2]).strip()
+        if not summary_text:
+            normalized = re.sub(r"\s+", " ", page_text).strip()
+            summary_text = normalized[:220].strip()
+            if len(normalized) > 220:
+                summary_text += "..."
+        key_points = sentences[:3] if sentences else ([summary_text] if summary_text else [])
+        page_summaries.append(
+            {
+                "page_number": page_number,
+                "summary_text": summary_text,
+                "key_points": key_points[:3],
+                "char_count": len(page_text),
+                "summary_source": "pipeline_page_fallback",
+            }
+        )
+    return page_summaries
+
+
+def extract_markdown_pages(markdown: str) -> list[dict[str, Any]]:
+    text = str(markdown or "").replace("\r\n", "\n").replace("\r", "\n")
+    matches = list(PAGE_HEADING_RE.finditer(text))
+    if not matches:
+        stripped = text.strip()
+        return [{"page_number": 1, "text": stripped}] if stripped else []
+
+    pages: list[dict[str, Any]] = []
+    for index, match in enumerate(matches):
+        try:
+            page_number = int(match.group(1))
+        except ValueError:
+            continue
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        page_text = text[start:end].strip()
+        if not page_text:
+            continue
+        pages.append(
+            {
+                "page_number": page_number,
+                "text": page_text,
+            }
+        )
+    return pages
+
+
 def load_summary_map(structured_documents_root: Path | Iterable[Path]) -> dict[str, dict[str, Any]]:
     summaries: dict[str, dict[str, Any]] = {}
     for path in _iter_structured_document_paths(structured_documents_root):
         try:
             payload = json.loads(read_text_with_fallback(path)[0])
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         payload = ensure_basic_summary(payload)
         document_id = str(payload.get("document_id") or "")
@@ -151,7 +229,7 @@ def backfill_basic_summaries(structured_documents_root: Path) -> int:
     for path in sorted(structured_documents_root.glob("*.json")):
         try:
             payload = json.loads(read_text_with_fallback(path)[0])
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         if payload.get("basic_summary"):
             continue
@@ -169,7 +247,7 @@ def backfill_llm_summaries(structured_documents_root: Path) -> int:
     for path in sorted(structured_documents_root.glob("*.json")):
         try:
             payload = json.loads(read_text_with_fallback(path)[0])
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         if payload.get("llm_summary"):
             continue
@@ -340,7 +418,10 @@ def _iter_structured_document_paths(structured_documents_root: Path | Iterable[P
         if not root.exists():
             continue
         for path in sorted(root.glob("*.json")):
-            key = str(path.resolve())
+            try:
+                key = str(path.resolve())
+            except OSError:
+                continue
             if key in seen:
                 continue
             seen.add(key)

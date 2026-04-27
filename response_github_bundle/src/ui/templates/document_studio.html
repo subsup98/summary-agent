@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Document Studio</title>
-  <link rel="stylesheet" href="/static/document-studio.css?v=20260412b">
+  <link rel="stylesheet" href="/static/document-studio.css?v=20260415a">
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 </head>
@@ -65,6 +65,15 @@
             </button>
             <div class="source-summary-body" id="source-summary-body">
               <p class="source-summary-text" id="source-detail-summary">선택한 문서의 요약이 여기에 표시됩니다.</p>
+            </div>
+          </section>
+
+          <section class="source-page-summary-card">
+            <div class="source-original-head">
+              <strong>페이지별 요약</strong>
+            </div>
+            <div class="source-page-summary-list" id="source-page-summary-list">
+              <div class="muted">페이지별 요약을 불러오는 중입니다.</div>
             </div>
           </section>
 
@@ -155,7 +164,7 @@
     </section>
   </div>
 
-  <script src="/static/document-studio.js?v=20260413a" defer></script>
+  <script src="/static/document-studio.js?v=20260415a" defer></script>
 </body>
 </html>
 

@@ -105,14 +105,20 @@ class OpenAIEmbeddingBackend(Embeddings):
 
         def _do_request() -> dict:
             try:
-                with _open_url(req, timeout=120) as response:
+                with _open_url(req, timeout=6) as response:
                     return json.loads(response.read().decode("utf-8"))
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 exc.reason = f"OpenAI embeddings error: {exc.code} {detail}"
                 raise
 
-        body = call_with_retry(_do_request, context="OpenAIEmbeddingBackend")
+        body = call_with_retry(
+            _do_request,
+            context="OpenAIEmbeddingBackend",
+            max_retries=0,
+            base_delay=0.2,
+            max_delay=1.0,
+        )
         data = body.get("data", [])
         return [item["embedding"] for item in data]
 

@@ -3,10 +3,12 @@
 import html
 import hashlib
 import json
+import os
 import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -17,14 +19,24 @@ from urllib.parse import unquote
 from uuid import uuid4
 
 import fitz
+import olefile
 
+from src.classifiers.document_classifier import classify_document
 from src.indexing.chroma_store import ChromaIndexManager
 from src.indexing.embedding_backends import EmbeddingBackend
+from src.parsers.pdf.markdown_extractor import PdfMarkdownExtractor
 from src.pipeline.parsing_pipeline import ParsingPipeline, ParsingPipelineConfig
 from src.retrieval.document_summary import ensure_basic_summary
 from src.retrieval.openai_answerer import load_openai_settings
 from src.shared.constants import SUPPORTED_EXTENSIONS
-from src.shared.io import ensure_directory, iso_now, read_text_with_fallback, write_bytes, write_json
+from src.shared.io import ensure_directory, iso_now, make_artifact_stem, read_text_with_fallback, write_bytes, write_json, write_text
+from src.shared.office_pdf_converter import (
+    LIBREOFFICE_CONVERTIBLE_EXTENSIONS,
+    convert_office_source_to_pdf,
+    find_libreoffice,
+    iter_libreoffice_candidates,
+    libreoffice_has_h2orestart,
+)
 from src.evaluation.embedding_model_comparison import TARGET_MODELS, EmbeddingModelComparisonRunner
 from src.ui.parsing_review_report import ParsingReviewSiteBuilder
 
@@ -273,6 +285,10 @@ class ReviewSessionManager:
                 if document.get("status") == "duplicate"
             ]
             summary["duplicate_documents"] = len(duplicate_uploads) + len(content_duplicate_uploads)
+            office_pdf_compare = self._build_office_pdf_strategy_compare(
+                session_root=session_root,
+                saved_uploads=unique_uploads,
+            )
 
             session = {
                 "run_id": run_id,
@@ -281,9 +297,19 @@ class ReviewSessionManager:
                 "review_url": f"/runs/{run_id}/reports/parsing_review/index.html",
                 "overlay_review_url": f"/runs/{run_id}/reports/pdf_overlay_review/index.html",
                 "parsing_review_url": f"/runs/{run_id}/reports/parsing_review/index.html",
+                "office_pdf_compare_url": (
+                    f"/runs/{run_id}/reports/office_pdf_strategy_compare/index.html"
+                    if office_pdf_compare and office_pdf_compare.get("document_count", 0) > 0
+                    else None
+                ),
                 "review_index_path": (session_root / "reports" / "parsing_review" / "index.html").as_posix(),
                 "overlay_review_index_path": (session_root / "reports" / "pdf_overlay_review" / "index.html").as_posix(),
                 "parsing_review_index_path": (session_root / "reports" / "parsing_review" / "index.html").as_posix(),
+                "office_pdf_compare_index_path": (
+                    (session_root / "reports" / "office_pdf_strategy_compare" / "index.html").as_posix()
+                    if office_pdf_compare and office_pdf_compare.get("document_count", 0) > 0
+                    else None
+                ),
                 "latest_run_markdown_path": (session_root / "parsing" / "logs" / "latest_run.md").as_posix(),
                 "upload_count": len(saved_uploads),
                 "uploads": unique_uploads,
@@ -292,6 +318,7 @@ class ReviewSessionManager:
                 "skipped_uploads": skipped_uploads,
                 "summary": summary,
                 "vector_index": vector_summary,
+                "office_pdf_compare": office_pdf_compare,
                 "timings": stage_timings,
             }
             write_json(session_root / "session.json", session)
@@ -314,7 +341,7 @@ class ReviewSessionManager:
         }
 
     def get_document_list(self) -> list[dict[str, Any]]:
-        documents: list[dict[str, Any]] = []
+        documents_by_source: dict[str, dict[str, Any]] = {}
         for path in self._iter_structured_document_paths():
             payload = self._read_json(path)
             if not payload:
@@ -327,10 +354,11 @@ class ReviewSessionManager:
                 modified_at = path.stat().st_mtime
             except OSError:
                 modified_at = 0.0
-            documents.append(
-                {
+            source_name = str(payload.get("source_name", ""))
+            source_key = self._normalize_source_key(source_name) or document_id
+            entry = {
                 "document_id": document_id,
-                "source_name": payload.get("source_name", ""),
+                "source_name": source_name,
                 "extension": payload.get("extension", ""),
                 "document_type": (payload.get("classification") or {}).get("document_type", ""),
                 "basic_summary": payload.get("basic_summary", {}),
@@ -339,13 +367,24 @@ class ReviewSessionManager:
                 "origin": "upload" if "/outputs/ui_runs/" in path.as_posix().replace("\\", "/") else "project",
                 "document_path": path.as_posix(),
                 "modified_at": modified_at,
-                "pipeline_timing": self._find_session_timing_for_document(
-                    document_id=document_id,
-                    source_name=str(payload.get("source_name", "")),
-                ),
-                }
-            )
-        documents.sort(key=lambda item: (float(item.get("modified_at") or 0.0), str(item.get("document_id") or "")), reverse=True)
+                "pipeline_timing": None,
+                "duplicate_document_ids": [],
+                "variant_count": 1,
+            }
+            existing = documents_by_source.get(source_key)
+            if existing is None:
+                documents_by_source[source_key] = entry
+                continue
+            existing["duplicate_document_ids"] = [
+                *existing.get("duplicate_document_ids", []),
+                document_id,
+            ]
+            existing["variant_count"] = int(existing.get("variant_count") or 1) + 1
+        documents = list(documents_by_source.values())
+        documents.sort(
+            key=lambda item: (float(item.get("modified_at") or 0.0), str(item.get("document_id") or "")),
+            reverse=True,
+        )
         return documents
 
     def _find_session_timing_for_document(self, *, document_id: str, source_name: str) -> dict[str, Any] | None:
@@ -395,26 +434,143 @@ class ReviewSessionManager:
             return None
         return candidate if candidate.exists() else None
 
-    _LIBREOFFICE_CANDIDATES = [
-        Path("C:/Program Files/LibreOffice/program/soffice.exe"),
-        Path("C:/Program Files/LibreOffice/program/soffice.com"),
-        Path("C:/Program Files (x86)/LibreOffice/program/soffice.exe"),
-        Path("C:/Program Files (x86)/LibreOffice/program/soffice.com"),
-    ]
-    _LIBREOFFICE_CONVERTIBLE = {".doc", ".docx", ".hwp", ".hwpx"}
+    _LIBREOFFICE_CONVERTIBLE = LIBREOFFICE_CONVERTIBLE_EXTENSIONS
 
     def _find_libreoffice(self) -> Path | None:
-        for candidate in self._LIBREOFFICE_CANDIDATES:
+        return find_libreoffice()
+
+    def _iter_libreoffice_candidates(self, preferred: Path | None) -> list[Path]:
+        return iter_libreoffice_candidates(preferred)
+
+    def _get_libreoffice_user_profile(self) -> Path | None:
+        candidates = [
+            Path.home() / "AppData" / "Roaming" / "LibreOffice" / "4" / "user",
+            Path("C:/Users/yongseop.im/AppData/Roaming/LibreOffice/4/user"),
+        ]
+        for candidate in candidates:
             if candidate.exists():
                 return candidate
-        found = shutil.which("soffice")
-        return Path(found) if found else None
+        return None
+
+    def _libreoffice_has_h2orestart(self) -> bool:
+        return libreoffice_has_h2orestart()
+
+    def _build_libreoffice_env(
+        self,
+        *,
+        source_path: Path,
+        profile_root: Path,
+    ) -> dict[str, str]:
+        env = os.environ.copy()
+        if source_path.suffix.lower() not in {".hwp", ".hwpx"} or not self._libreoffice_has_h2orestart():
+            return env
+        home_dir = profile_root / "home"
+        temp_dir = profile_root / "tmp"
+        ensure_directory(home_dir)
+        ensure_directory(temp_dir)
+        java_tool_options = str(env.get("JAVA_TOOL_OPTIONS") or "").strip()
+        user_home_option = f"-Duser.home={home_dir}"
+        env["JAVA_TOOL_OPTIONS"] = f"{java_tool_options} {user_home_option}".strip() if java_tool_options else user_home_option
+        env["USERPROFILE"] = str(home_dir)
+        env["HOME"] = str(home_dir)
+        env["TMP"] = str(temp_dir)
+        env["TEMP"] = str(temp_dir)
+        return env
+
+    def _seed_libreoffice_profile(self, *, source_path: Path, profile_root: Path) -> None:
+        if source_path.suffix.lower() not in {".hwp", ".hwpx"} or not self._libreoffice_has_h2orestart():
+            return
+        user_profile = self._get_libreoffice_user_profile()
+        if user_profile is None:
+            return
+        src_uno_packages = user_profile / "uno_packages"
+        if not src_uno_packages.exists():
+            return
+        dest_uno_packages = profile_root / "user" / "uno_packages"
+        ensure_directory(dest_uno_packages.parent)
+        shutil.copytree(src_uno_packages, dest_uno_packages, dirs_exist_ok=True)
 
     def convert_source_to_pdf(self, source_path: Path, dest_path: Path) -> bool:
         """LibreOffice로 doc/docx/hwp/hwpx → PDF 변환. 성공 시 True 반환."""
-        soffice = self._find_libreoffice()
-        if not soffice:
-            return False
+        return convert_office_source_to_pdf(source_path, dest_path)
+
+    def _detect_image_format(self, content: bytes) -> str | None:
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "png"
+        if content.startswith(b"\xff\xd8\xff"):
+            return "jpeg"
+        if content.startswith((b"GIF87a", b"GIF89a")):
+            return "gif"
+        if content.startswith(b"BM"):
+            return "bmp"
+        if content.startswith(b"II*\x00") or content.startswith(b"MM\x00*"):
+            return "tiff"
+        return None
+
+    def _extract_hwp_preview_image(self, source_path: Path) -> tuple[bytes, str] | None:
+        if source_path.suffix.lower() != ".hwp" or not source_path.exists():
+            return None
+        if not olefile.isOleFile(source_path):
+            return None
+        try:
+            with olefile.OleFileIO(source_path) as ole:
+                if not ole.exists("PrvImage"):
+                    return None
+                preview_bytes = ole.openstream("PrvImage").read()
+        except Exception:
+            return None
+
+        image_format = self._detect_image_format(preview_bytes)
+        if not image_format:
+            return None
+        return preview_bytes, image_format
+
+    def get_document_preview_image_path(self, *, document_id: str = "", source_name: str = "") -> Path | None:
+        payload = self.get_document_payload(document_id=document_id, source_name=source_name)
+        if not payload:
+            return None
+        source_path = self.get_document_source_path(document_id=document_id, source_name=source_name)
+        if source_path is None or source_path.suffix.lower() != ".hwp":
+            return None
+        preview_image = self._extract_hwp_preview_image(source_path)
+        if preview_image is None:
+            return None
+
+        resolved_source_name = str(payload.get("source_name") or source_name or "").strip()
+        preview_cache_key = self._build_preview_cache_key(
+            payload=payload,
+            source_name=source_name,
+            document_id=document_id,
+        )
+        if not preview_cache_key:
+            return None
+
+        preview_bytes, image_format = preview_image
+        preview_path = self.preview_root / f"{preview_cache_key}.{image_format}"
+        if self._is_preview_cache_valid(
+            preview_path=preview_path,
+            source_path=source_path,
+            source_name=resolved_source_name,
+        ):
+            return preview_path
+
+        self._safe_remove_preview_artifacts(preview_path)
+        try:
+            ensure_directory(preview_path.parent)
+            write_bytes(preview_path, preview_bytes)
+        except OSError:
+            return None
+        if not preview_path.exists():
+            return None
+        self._write_preview_metadata(
+            preview_path=preview_path,
+            source_path=source_path,
+            source_name=resolved_source_name,
+            strategy="hwp-preview-image-raw",
+        )
+        return preview_path
+
+    def _build_preview_pdf_from_image(self, image_bytes: bytes, dest_path: Path) -> bool:
         try:
             ensure_directory(dest_path.parent)
             if dest_path.exists():
@@ -422,44 +578,176 @@ class ReviewSessionManager:
                     dest_path.unlink()
                 except OSError:
                     pass
-            result = subprocess.run(
-                [
-                    str(soffice),
-                    "--headless",
-                    "--convert-to", "pdf",
-                    "--outdir", str(dest_path.parent),
-                    str(source_path),
-                ],
-                capture_output=True,
-                timeout=120,
-            )
-            if result.returncode != 0:
-                return False
-            converted = dest_path.parent / (source_path.stem + ".pdf")
-            if converted.exists() and converted != dest_path:
-                if dest_path.exists():
-                    dest_path.unlink()
-                shutil.move(str(converted), str(dest_path))
+
+            image_document = fitz.open(stream=image_bytes)
+            try:
+                image_rect = image_document[0].rect
+                image_width = max(float(image_rect.width), 1.0)
+                image_height = max(float(image_rect.height), 1.0)
+            finally:
+                image_document.close()
+
+            page_width = 595.0
+            page_height = max(842.0, page_width * (image_height / image_width))
+            margin = 24.0
+            available_width = page_width - (margin * 2)
+            available_height = page_height - (margin * 2)
+            scale = min(available_width / image_width, available_height / image_height)
+            render_width = image_width * scale
+            render_height = image_height * scale
+            x0 = (page_width - render_width) / 2
+            y0 = (page_height - render_height) / 2
+
+            document = fitz.open()
+            try:
+                page = document.new_page(width=page_width, height=page_height)
+                page.insert_image(fitz.Rect(x0, y0, x0 + render_width, y0 + render_height), stream=image_bytes)
+                document.save(dest_path)
+            finally:
+                document.close()
             return dest_path.exists()
         except Exception:
             return False
+
+    def _get_preview_meta_path(self, preview_path: Path) -> Path:
+        return preview_path.with_suffix(".meta.json")
+
+    def _build_preview_cache_key(
+        self,
+        *,
+        payload: dict[str, Any] | None = None,
+        source_name: str = "",
+        document_id: str = "",
+    ) -> str:
+        resolved_source_name = str((payload or {}).get("source_name") or source_name or "").strip()
+        normalized_source = self._normalize_source_key(resolved_source_name)
+        if normalized_source:
+            stem = self._sanitize_filename(Path(resolved_source_name).stem) or "document"
+            digest = hashlib.sha1(normalized_source.encode("utf-8")).hexdigest()[:10]
+            return f"{stem}--src-{digest}"
+        fallback_id = str((payload or {}).get("document_id") or document_id or "").strip()
+        return fallback_id or "document-preview"
+
+    def _write_preview_metadata(
+        self,
+        *,
+        preview_path: Path,
+        source_path: Path | None,
+        source_name: str,
+        strategy: str,
+    ) -> None:
+        meta_path = self._get_preview_meta_path(preview_path)
+        payload = {
+            "preview_path": preview_path.as_posix(),
+            "source_path": source_path.as_posix() if source_path else None,
+            "source_name": source_name,
+            "normalized_source_name": self._normalize_source_key(source_name),
+            "source_mtime": round(source_path.stat().st_mtime, 6) if source_path and source_path.exists() else None,
+            "source_size": int(source_path.stat().st_size) if source_path and source_path.exists() else None,
+            "preview_mtime": round(preview_path.stat().st_mtime, 6) if preview_path.exists() else None,
+            "strategy": strategy,
+            "generated_at": iso_now(),
+        }
+        write_json(meta_path, payload)
+
+    def _is_preview_cache_valid(self, *, preview_path: Path, source_path: Path | None, source_name: str) -> bool:
+        if not preview_path.exists():
+            return False
+        meta_path = self._get_preview_meta_path(preview_path)
+        if not meta_path.exists():
+            return False
+        metadata = self._read_json(meta_path)
+        if not metadata:
+            return False
+        if str(metadata.get("preview_path") or "").strip() != preview_path.as_posix():
+            return False
+        if self._normalize_source_key(str(metadata.get("source_name") or "")) != self._normalize_source_key(source_name):
+            return False
+        if source_path is None:
+            return True
+        cached_strategy = str(metadata.get("strategy") or "").strip().lower()
+        if (
+            source_path.suffix.lower() == ".hwp"
+            and cached_strategy in {"markdown-fallback", "hwp-preview-image"}
+            and (
+                self._libreoffice_has_h2orestart()
+                or self._extract_hwp_preview_image(source_path) is not None
+            )
+        ):
+            return False
+        try:
+            cached_mtime = float(metadata.get("source_mtime"))
+        except (TypeError, ValueError):
+            return False
+        try:
+            current_mtime = round(source_path.stat().st_mtime, 6)
+        except OSError:
+            return False
+        try:
+            cached_size = int(metadata.get("source_size"))
+        except (TypeError, ValueError):
+            return False
+        try:
+            current_size = int(source_path.stat().st_size)
+        except OSError:
+            return False
+        return abs(cached_mtime - current_mtime) < 0.000001 and cached_size == current_size
+
+    def _safe_remove_preview_artifacts(self, preview_path: Path) -> None:
+        for candidate in (preview_path, self._get_preview_meta_path(preview_path)):
+            if not candidate.exists():
+                continue
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
 
     def get_document_preview_pdf_path(self, *, document_id: str = "", source_name: str = "") -> Path | None:
         payload = self.get_document_payload(document_id=document_id, source_name=source_name)
         if not payload:
             return None
-        target_document_id = str(payload.get("document_id") or document_id or "").strip()
-        if not target_document_id:
+        preview_cache_key = self._build_preview_cache_key(
+            payload=payload,
+            source_name=source_name,
+            document_id=document_id,
+        )
+        if not preview_cache_key:
             return None
-        preview_path = self.preview_root / f"{target_document_id}.pdf"
-        if preview_path.exists():
+        preview_path = self.preview_root / f"{preview_cache_key}.pdf"
+        source_path = self.get_document_source_path(document_id=document_id, source_name=source_name)
+        resolved_source_name = str(payload.get("source_name") or source_name or "").strip()
+        if self._is_preview_cache_valid(
+            preview_path=preview_path,
+            source_path=source_path,
+            source_name=resolved_source_name,
+        ):
             return preview_path
 
         # doc/docx/hwp/hwpx → LibreOffice로 직접 변환
-        source_path = self.get_document_source_path(document_id=document_id, source_name=source_name)
         if source_path and source_path.suffix.lower() in self._LIBREOFFICE_CONVERTIBLE:
+            self._safe_remove_preview_artifacts(preview_path)
             if self.convert_source_to_pdf(source_path, preview_path):
+                self._write_preview_metadata(
+                    preview_path=preview_path,
+                    source_path=source_path,
+                    source_name=resolved_source_name,
+                    strategy="libreoffice",
+                )
                 return preview_path
+
+        if source_path and source_path.suffix.lower() == ".hwp":
+            preview_image = self._extract_hwp_preview_image(source_path)
+            if preview_image is not None:
+                self._safe_remove_preview_artifacts(preview_path)
+                preview_bytes, _image_format = preview_image
+                if self._build_preview_pdf_from_image(preview_bytes, preview_path):
+                    self._write_preview_metadata(
+                        preview_path=preview_path,
+                        source_path=source_path,
+                        source_name=resolved_source_name,
+                        strategy="hwp-preview-image",
+                    )
+                    return preview_path
 
         markdown = str(payload.get("markdown") or "").strip()
         if not markdown:
@@ -483,6 +771,12 @@ class ReviewSessionManager:
             cursor_y = margin
             page = document.new_page(width=page_width, height=page_height)
             font_name = "helv"
+            if font_path is not None:
+                try:
+                    font_name = "fallback-ui-font"
+                    page.insert_font(fontname=font_name, fontfile=str(font_path))
+                except Exception:
+                    font_name = "helv"
 
             normalized_lines: list[str] = []
             for block in markdown.splitlines():
@@ -509,6 +803,11 @@ class ReviewSessionManager:
                 if overflow < 0:
                     page = document.new_page(width=page_width, height=page_height)
                     cursor_y = margin
+                    if font_path is not None and font_name != "helv":
+                        try:
+                            page.insert_font(fontname=font_name, fontfile=str(font_path))
+                        except Exception:
+                            font_name = "helv"
                     box = fitz.Rect(margin, cursor_y, page_width - margin, cursor_y + 20)
                     page.insert_textbox(
                         box,
@@ -522,23 +821,79 @@ class ReviewSessionManager:
                 if cursor_y >= page_height - margin - 20:
                     page = document.new_page(width=page_width, height=page_height)
                     cursor_y = margin
+                    if font_path is not None and font_name != "helv":
+                        try:
+                            page.insert_font(fontname=font_name, fontfile=str(font_path))
+                        except Exception:
+                            font_name = "helv"
 
             document.save(preview_path)
         finally:
             document.close()
 
+        if preview_path.exists():
+            self._write_preview_metadata(
+                preview_path=preview_path,
+                source_path=source_path,
+                source_name=resolved_source_name,
+                strategy="markdown-fallback",
+            )
+
         return preview_path if preview_path.exists() else None
 
-    def delete_document_files(self, document_id: str) -> int:
-        """Delete structured JSON files for the given document_id. Returns count of removed files."""
-        removed = 0
+    def get_related_document_ids(self, *, document_id: str = "", source_name: str = "") -> list[str]:
+        normalized_source = self._normalize_source_key(source_name)
+        if not normalized_source and document_id:
+            payload = self.get_document_payload(document_id=document_id)
+            if payload:
+                normalized_source = self._normalize_source_key(str(payload.get("source_name") or ""))
+
+        related_ids: list[str] = []
+        seen_ids: set[str] = set()
         for path in self._iter_structured_document_paths():
             payload = self._read_json(path)
             if not payload:
                 continue
-            if str(payload.get("document_id", "")) == document_id:
+            payload_document_id = str(payload.get("document_id", "")).strip()
+            payload_source_key = self._normalize_source_key(str(payload.get("source_name") or ""))
+            if not payload_document_id:
+                continue
+            matches = bool(document_id and payload_document_id == document_id)
+            if normalized_source and payload_source_key == normalized_source:
+                matches = True
+            if not matches or payload_document_id in seen_ids:
+                continue
+            seen_ids.add(payload_document_id)
+            related_ids.append(payload_document_id)
+        return related_ids
+
+    def delete_document_files(self, document_ids: list[str] | str) -> int:
+        """Delete document payload and preview files for the given document ids."""
+        target_ids = [document_ids] if isinstance(document_ids, str) else list(document_ids)
+        target_set = {str(item).strip() for item in target_ids if str(item).strip()}
+        if not target_set:
+            return 0
+        removed = 0
+        preview_cache_keys: set[str] = set()
+        for path in self._iter_structured_document_paths():
+            payload = self._read_json(path)
+            if not payload:
+                continue
+            if str(payload.get("document_id", "")) in target_set:
+                preview_cache_keys.add(self._build_preview_cache_key(payload=payload))
                 try:
                     path.unlink()
+                    removed += 1
+                except Exception:
+                    pass
+        for preview_cache_key in preview_cache_keys:
+            preview_path = self.preview_root / f"{preview_cache_key}.pdf"
+            meta_path = self._get_preview_meta_path(preview_path)
+            for candidate in (preview_path, meta_path):
+                if not candidate.exists():
+                    continue
+                try:
+                    candidate.unlink()
                     removed += 1
                 except Exception:
                     pass
@@ -1013,6 +1368,299 @@ class ReviewSessionManager:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
 
+    def _build_office_pdf_strategy_compare(
+        self,
+        *,
+        session_root: Path,
+        saved_uploads: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        office_exts = {".doc", ".docx", ".hwp", ".hwpx"}
+        compare_targets = [
+            item for item in saved_uploads
+            if Path(str(item.get("stored_path") or "")).suffix.lower() in office_exts
+        ]
+        if not compare_targets:
+            return None
+
+        compare_root = session_root / "reports" / "office_pdf_strategy_compare"
+        # LibreOffice conversion on Windows becomes unreliable with long nested paths.
+        # Keep the staging area short and use hashed artifact stems for filenames.
+        converted_root = self.project_root / "outputs" / "tmp_office_pdf_compare" / session_root.name
+        artifacts_root = compare_root / "artifacts"
+        ensure_directory(compare_root)
+        ensure_directory(converted_root)
+        ensure_directory(artifacts_root)
+
+        extractor = PdfMarkdownExtractor(enable_omitted_picture_ocr=False)
+        documents: list[dict[str, Any]] = []
+
+        for item in compare_targets:
+            source_path = Path(str(item.get("stored_path") or ""))
+            if not source_path.exists():
+                continue
+            artifact_stem = make_artifact_stem(source_path)
+
+            converted_pdf_path = converted_root / f"{artifact_stem}.pdf"
+            conversion_ok = self.convert_source_to_pdf(source_path, converted_pdf_path)
+            document_entry: dict[str, Any] = {
+                "source_name": source_path.name,
+                "source_path": source_path.as_posix(),
+                "source_extension": source_path.suffix.lower(),
+                "converted_pdf_path": converted_pdf_path.as_posix(),
+                "conversion_succeeded": conversion_ok and converted_pdf_path.exists(),
+                "strategies": [],
+                "document_path": None,
+                "error": None,
+            }
+            if not conversion_ok or not converted_pdf_path.exists():
+                document_entry["error"] = "pdf_conversion_failed"
+                documents.append(document_entry)
+                continue
+
+            try:
+                classification = classify_document(converted_pdf_path)
+                with fitz.open(converted_pdf_path) as document:
+                    producer = str((document.metadata or {}).get("producer") or "")
+                    page_count = document.page_count
+                    document_entry["pdf_metadata"] = {
+                        "producer": producer,
+                        "page_count": page_count,
+                        "selected_strategy": classification.pdf_parser_strategy,
+                    }
+                    for strategy_name in ("structtree-actualtext", "pymupdf4llm"):
+                        result = extractor.extract(
+                            converted_pdf_path,
+                            document,
+                            classification,
+                            strategy_name=strategy_name,
+                        )
+                        strategy_stem = f"{artifact_stem}__{strategy_name}"
+                        markdown_path = artifacts_root / f"{strategy_stem}.md"
+                        metadata_path = artifacts_root / f"{strategy_stem}.json"
+                        markdown_path.write_text(result.markdown.rstrip() + "\n", encoding="utf-8")
+                        write_json(
+                            metadata_path,
+                            {
+                                "strategy_name": result.strategy_name,
+                                "applied_strategy": result.applied_strategy,
+                                "metadata": result.metadata,
+                                "elapsed_ms": result.elapsed_ms,
+                                "issue_count": len(result.issues),
+                                "issues": [issue.__dict__ for issue in result.issues],
+                                "char_count": len(result.markdown),
+                                "line_count": len(result.markdown.splitlines()),
+                            },
+                        )
+                        document_entry["strategies"].append(
+                            {
+                                "strategy_name": strategy_name,
+                                "applied_strategy": result.applied_strategy,
+                                "markdown_path": markdown_path.relative_to(compare_root).as_posix(),
+                                "metadata_path": metadata_path.relative_to(compare_root).as_posix(),
+                                "elapsed_ms": result.elapsed_ms,
+                                "issue_count": len(result.issues),
+                                "char_count": len(result.markdown),
+                                "line_count": len(result.markdown.splitlines()),
+                                "markdown": result.markdown,
+                                "issues": [issue.__dict__ for issue in result.issues],
+                            }
+                        )
+            except Exception as error:
+                document_entry["error"] = str(error)
+
+            document_html_path = compare_root / f"{artifact_stem}.html"
+            write_json(
+                compare_root / f"{artifact_stem}.summary.json",
+                {
+                    key: value
+                    for key, value in document_entry.items()
+                    if key != "strategies"
+                }
+                | {
+                    "strategies": [
+                        {
+                            key: value
+                            for key, value in strategy.items()
+                            if key not in {"markdown", "issues"}
+                        }
+                        | {"issues": strategy.get("issues", [])}
+                        for strategy in document_entry.get("strategies", [])
+                    ]
+                },
+            )
+            document_entry["document_path"] = document_html_path.as_posix()
+            write_text(document_html_path, self._render_office_pdf_compare_document_html(document_entry, compare_root))
+            documents.append(document_entry)
+
+        manifest = {
+            "generated_at": iso_now(),
+            "index_path": (compare_root / "index.html").as_posix(),
+            "document_count": len(documents),
+            "documents": [
+                {
+                    **{
+                        key: value
+                        for key, value in item.items()
+                        if key not in {"strategies"}
+                    },
+                    "strategies": [
+                        {
+                            key: value
+                            for key, value in strategy.items()
+                            if key not in {"markdown", "issues"}
+                        }
+                        | {"issues": strategy.get("issues", [])}
+                        for strategy in item.get("strategies", [])
+                    ],
+                }
+                for item in documents
+            ],
+        }
+        write_json(compare_root / "manifest.json", manifest)
+        write_text(compare_root / "index.html", self._render_office_pdf_compare_index_html(manifest, compare_root))
+        return manifest
+
+    def _render_office_pdf_compare_index_html(self, manifest: dict[str, Any], compare_root: Path) -> str:
+        rows: list[str] = []
+        for document in manifest.get("documents", []):
+            source_name = html.escape(str(document.get("source_name") or ""))
+            source_ext = html.escape(str(document.get("source_extension") or ""))
+            selected_strategy = html.escape(
+                str((document.get("pdf_metadata") or {}).get("selected_strategy") or "n/a")
+            )
+            producer = html.escape(str((document.get("pdf_metadata") or {}).get("producer") or "n/a"))
+            page_count = html.escape(str((document.get("pdf_metadata") or {}).get("page_count") or ""))
+            error = html.escape(str(document.get("error") or ""))
+            raw_doc_path = str(document.get("document_path") or "").strip()
+            doc_href = html.escape(Path(raw_doc_path).relative_to(compare_root).as_posix()) if raw_doc_path else ""
+            action = f'<a href="{doc_href}">Open Compare</a>' if doc_href else "-"
+            status = "ok" if document.get("conversion_succeeded") and not error else error or "conversion_failed"
+            rows.append(
+                "<tr><td>{name}</td><td>{ext}</td><td>{pages}</td><td>{producer}</td><td>{selected}</td><td>{status}</td><td>{action}</td></tr>".format(
+                    name=source_name,
+                    ext=source_ext,
+                    pages=page_count,
+                    producer=producer,
+                    selected=selected_strategy,
+                    status=html.escape(status),
+                    action=action,
+                )
+            )
+        if not rows:
+            rows.append("<tr><td colspan='7'>No office documents were converted in this run.</td></tr>")
+        return """<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Office to PDF Strategy Compare</title>
+<style>
+body {{ font-family: "Segoe UI", "Malgun Gothic", sans-serif; margin: 0; background: #f6f8fb; color: #172033; }}
+main {{ max-width: 1200px; margin: 0 auto; padding: 32px 24px 48px; }}
+.card {{ background: #fff; border: 1px solid #dce4f1; border-radius: 18px; padding: 20px; box-shadow: 0 10px 30px rgba(15,23,42,0.05); }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ padding: 12px 10px; border-bottom: 1px solid #e7edf6; text-align: left; vertical-align: top; font-size: 14px; }}
+th {{ color: #4a5d79; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }}
+a {{ color: #2457a7; text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+code {{ background: #f2f5fb; padding: 2px 6px; border-radius: 6px; }}
+</style></head><body><main>
+<div class="card">
+  <h1>Office Upload PDF Strategy Compare</h1>
+  <p>DOC/HWP uploads are converted to PDF and compared side by side using <code>structtree-actualtext</code> and <code>pymupdf4llm</code>.</p>
+  <table>
+    <thead><tr><th>Document</th><th>Ext</th><th>Pages</th><th>Producer</th><th>Metadata Selected</th><th>Status</th><th>Compare</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>
+</main></body></html>""".format(rows="".join(rows))
+
+    def _render_office_pdf_compare_document_html(self, document: dict[str, Any], compare_root: Path) -> str:
+        strategy_sections: list[str] = []
+        for strategy in document.get("strategies", []):
+            metadata_href = html.escape(str(strategy.get("metadata_path") or ""))
+            markdown_href = html.escape(str(strategy.get("markdown_path") or ""))
+            issues = strategy.get("issues") or []
+            issues_html = (
+                "<ul>{items}</ul>".format(
+                    items="".join(
+                        "<li><strong>{code}</strong>: {message}</li>".format(
+                            code=html.escape(str(issue.get("code") or "")),
+                            message=html.escape(str(issue.get("message") or "")),
+                        )
+                        for issue in issues
+                    )
+                )
+                if issues
+                else "<p>No issues recorded.</p>"
+            )
+            strategy_sections.append(
+                """
+<section class="strategy-card">
+  <div class="strategy-head">
+    <h2>{name}</h2>
+    <div class="meta">Applied: <code>{applied}</code> | {chars} chars | {lines} lines | {elapsed} ms</div>
+    <div class="links"><a href="{md}">Markdown</a> · <a href="{meta}">Metadata JSON</a></div>
+  </div>
+  <div class="issues">{issues}</div>
+  <pre>{markdown}</pre>
+</section>
+""".format(
+                    name=html.escape(str(strategy.get("strategy_name") or "")),
+                    applied=html.escape(str(strategy.get("applied_strategy") or "")),
+                    chars=html.escape(str(strategy.get("char_count") or 0)),
+                    lines=html.escape(str(strategy.get("line_count") or 0)),
+                    elapsed=html.escape(str(strategy.get("elapsed_ms") or 0)),
+                    md=markdown_href,
+                    meta=metadata_href,
+                    issues=issues_html,
+                    markdown=html.escape(str(strategy.get("markdown") or "")),
+                )
+            )
+        if not strategy_sections:
+            strategy_sections.append("<p>No strategy output available.</p>")
+
+        producer = html.escape(str((document.get("pdf_metadata") or {}).get("producer") or "n/a"))
+        page_count = html.escape(str((document.get("pdf_metadata") or {}).get("page_count") or ""))
+        selected = html.escape(str((document.get("pdf_metadata") or {}).get("selected_strategy") or "n/a"))
+        return """<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+body {{ font-family: "Segoe UI", "Malgun Gothic", sans-serif; margin: 0; background: #f6f8fb; color: #172033; }}
+main {{ max-width: 1600px; margin: 0 auto; padding: 32px 24px 48px; }}
+.hero, .strategy-grid {{ display: grid; gap: 18px; }}
+.hero-card, .strategy-card {{ background: #fff; border: 1px solid #dce4f1; border-radius: 18px; padding: 20px; box-shadow: 0 10px 30px rgba(15,23,42,0.05); }}
+.strategy-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }}
+.meta {{ color: #4a5d79; font-size: 14px; line-height: 1.7; }}
+.links a {{ color: #2457a7; text-decoration: none; }}
+.links a:hover {{ text-decoration: underline; }}
+pre {{ white-space: pre-wrap; word-break: break-word; background: #f8fafe; border: 1px solid #e5ebf5; border-radius: 12px; padding: 14px; font-size: 12px; line-height: 1.6; overflow: auto; max-height: 70vh; }}
+code {{ background: #f2f5fb; padding: 2px 6px; border-radius: 6px; }}
+ul {{ margin: 8px 0 0; padding-left: 18px; }}
+@media (max-width: 1100px) {{ .strategy-grid {{ grid-template-columns: 1fr; }} }}
+</style></head><body><main>
+<div class="hero">
+  <div class="hero-card">
+    <p><a href="index.html">Back to index</a></p>
+    <h1>{title}</h1>
+    <div class="meta">
+      <div>Source: <code>{source_path}</code></div>
+      <div>Converted PDF: <code>{pdf_path}</code></div>
+      <div>PDF Pages: <code>{page_count}</code></div>
+      <div>Producer: <code>{producer}</code></div>
+      <div>Metadata-selected strategy: <code>{selected}</code></div>
+    </div>
+  </div>
+</div>
+<div class="strategy-grid">{sections}</div>
+</main></body></html>""".format(
+            title=html.escape(str(document.get("source_name") or "")),
+            source_path=html.escape(str(document.get("source_path") or "")),
+            pdf_path=html.escape(str(document.get("converted_pdf_path") or "")),
+            page_count=page_count,
+            producer=producer,
+            selected=selected,
+            sections="".join(strategy_sections),
+        )
+
     def _find_latest_chunking_comparison_dir(self) -> Path | None:
         root = self.project_root / "outputs" / "chunking_strategy_compare"
         if not root.exists():
@@ -1033,6 +1681,8 @@ class ReviewSessionManager:
         roots = [self.project_root / "data" / "structured" / "documents"]
         if self.runs_root.exists():
             for path in sorted(self.runs_root.glob("*/structured/documents"), reverse=True):
+                roots.append(path)
+            for path in sorted(self.runs_root.glob("*/parsing/json"), reverse=True):
                 roots.append(path)
         paths: list[Path] = []
         seen: set[str] = set()

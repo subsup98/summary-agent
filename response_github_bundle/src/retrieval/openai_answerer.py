@@ -97,7 +97,7 @@ class OpenAIAnswerSynthesizer:
 
         return (
             "You are an expert document summarizer. Your role is to extract and present only what the provided evidence explicitly states.\n"
-            "Write in natural Korean. Be concise and precise. Do not guess, infer, or add information not present in the evidence.\n"
+            "Write in natural Korean honorific speech (존댓말). Be concise and precise. Do not guess, infer, or add information not present in the evidence.\n"
             "If the evidence is insufficient to answer, clearly state that in the answer field.\n"
             "Return strict JSON only with this shape:\n"
             '{"answer":"string","citations":[{"source_number":1,"quote":"string"}]}\n'
@@ -128,7 +128,7 @@ class OpenAIAnswerSynthesizer:
 
         def _do_request() -> dict[str, Any]:
             try:
-                with _open_url(req, timeout=60) as response:
+                with _open_url(req, timeout=6) as response:
                     return json.loads(response.read().decode("utf-8"))
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
@@ -136,7 +136,13 @@ class OpenAIAnswerSynthesizer:
                 exc.reason = f"OpenAI API error: {exc.code} {detail}"
                 raise
 
-        return call_with_retry(_do_request, context="OpenAIAnswerSynthesizer")
+        return call_with_retry(
+            _do_request,
+            context="OpenAIAnswerSynthesizer",
+            max_retries=0,
+            base_delay=0.2,
+            max_delay=1.0,
+        )
 
     def _extract_text(self, payload: dict[str, Any]) -> str:
         output = payload.get("output", [])

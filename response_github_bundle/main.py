@@ -31,12 +31,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.retrieval.chroma_retriever import ChromaRetriever  # noqa: E402
+from src.retrieval.document_summary import build_page_summaries  # noqa: E402
 from src.parsers.pdf.markdown_extractor import PdfMarkdownExtractor  # noqa: E402
 from src.shared.constants import SUPPORTED_EXTENSIONS  # noqa: E402
 from src.ui.review_server import ReviewSessionManager, UploadedDocument  # noqa: E402
 
 
 DEFAULT_QA_STRATEGY = "semantic"
+
+LLM_SUMMARY_SOURCES = {
+    "on_demand_llm",
+    "cached_ui_summary",
+    "pipeline_llm_summary",
+}
+
+LLM_PAGE_SUMMARY_SOURCE = "on_demand_page_llm"
 
 
 def is_semantic_strategy_available() -> bool:
@@ -72,6 +81,52 @@ def make_json_safe(value: object) -> object:
     if isinstance(value, (list, tuple, set)):
         return [make_json_safe(item) for item in value]
     return str(value)
+
+
+def _is_llm_summary_payload(summary: dict[str, object] | None) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    source = str(summary.get("summary_source") or "")
+    if source in LLM_SUMMARY_SOURCES:
+        return True
+    used_model = str(summary.get("used_model") or "")
+    return bool(used_model and used_model not in {"cached_basic_summary", "cached_llm_summary"})
+
+
+def _normalize_page_summary_items(raw_page_summaries: object) -> list[dict[str, object]]:
+    if not isinstance(raw_page_summaries, list):
+        return []
+
+    normalized: list[dict[str, object]] = []
+    for item in raw_page_summaries:
+        if not isinstance(item, dict):
+            continue
+        try:
+            page_number = int(item.get("page_number") or 0)
+        except (TypeError, ValueError):
+            page_number = 0
+        summary_text = str(item.get("summary_text") or "").strip()
+        if page_number <= 0 or not summary_text:
+            continue
+        normalized.append(
+            {
+                "page_number": page_number,
+                "summary_text": summary_text,
+                "key_points": [str(point).strip() for point in (item.get("key_points") or []) if str(point).strip()][:4],
+                "summary_source": str(item.get("summary_source") or ""),
+                "char_count": int(item.get("char_count") or 0),
+            }
+        )
+    normalized.sort(key=lambda item: int(item.get("page_number") or 0))
+    return normalized
+
+
+def _has_llm_page_summaries(raw_page_summaries: object) -> bool:
+    page_summaries = _normalize_page_summary_items(raw_page_summaries)
+    return bool(page_summaries) and all(
+        str(item.get("summary_source") or "") == LLM_PAGE_SUMMARY_SOURCE
+        for item in page_summaries
+    )
 
 
 def clean_viewer_markdown(markdown: str) -> str:
@@ -2748,6 +2803,9 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/document-content":
                 self._handle_document_content()
                 return
+            if path == "/api/document-element-preview":
+                self._handle_document_element_preview()
+                return
             if path == "/api/document-original":
                 self._handle_document_original()
                 return
@@ -2807,9 +2865,28 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
                 return
             results = []
             for doc_id in document_ids:
-                vector_result = self.manager.index_manager.delete_document(doc_id)
-                files_removed = self.manager.delete_document_files(doc_id)
-                results.append({**vector_result, "files_removed": files_removed})
+                related_ids = self.manager.get_related_document_ids(document_id=doc_id)
+                if not related_ids:
+                    related_ids = [doc_id]
+                vector_deleted_rule = 0
+                vector_deleted_semantic = 0
+                registry_removed = 0
+                for target_doc_id in related_ids:
+                    vector_result = self.manager.index_manager.delete_document(target_doc_id)
+                    vector_deleted_rule += int(vector_result.get("deleted_rule_chunks") or 0)
+                    vector_deleted_semantic += int(vector_result.get("deleted_semantic_chunks") or 0)
+                    registry_removed += int(vector_result.get("removed_from_registry") or 0)
+                files_removed = self.manager.delete_document_files(related_ids)
+                results.append(
+                    {
+                        "document_id": doc_id,
+                        "deleted_document_ids": related_ids,
+                        "deleted_rule_chunks": vector_deleted_rule,
+                        "deleted_semantic_chunks": vector_deleted_semantic,
+                        "removed_from_registry": registry_removed,
+                        "files_removed": files_removed,
+                    }
+                )
         except ValueError as error:
             self._send_json({"error": str(error)}, status=400)
             return
@@ -2873,24 +2950,38 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(result, status=200)
                     return
             if self.langchain_service is None:
-                basic_result = self._build_basic_summary_payload(
-                    document_payload,
-                    document_id=document_id,
-                    source_name=source_name,
+                self._send_json(
+                    {
+                        "error": "langchain_service_unavailable",
+                        "warning": "LLM summary service is not available.",
+                        "document_id": document_id,
+                        "source_name": source_name,
+                    },
+                    status=503,
                 )
-                if basic_result:
-                    self._send_json(basic_result, status=200)
-                    return
-                self._send_json({"error": "langchain_service_unavailable"}, status=503)
                 return
             result = self.langchain_service.summarize_document(document_id=document_id, source_name=source_name)
+            if _is_llm_summary_payload(result):
+                self._send_json(result, status=200)
+                return
+            warning = str(result.get("warning") or result.get("error") or "llm_summary_unavailable")
+            self._send_json(
+                {
+                    "error": "llm_summary_unavailable",
+                    "warning": warning,
+                    "document_id": result.get("document_id", document_id),
+                    "source_name": result.get("source_name", source_name),
+                    "summary_source": result.get("summary_source") or "",
+                },
+                status=503,
+            )
+            return
         except ValueError as error:
             self._send_json({"error": str(error)}, status=400)
             return
         except Exception as error:
             self._send_json({"error": str(error)}, status=500)
             return
-        self._send_json(result, status=200)
 
     def _handle_download_summary(self) -> None:
         try:
@@ -2949,17 +3040,236 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             if source_path and source_path.suffix.lower() == ".pdf":
                 self._serve_file(source_path)
                 return
+            # NOTE: Keep PDF preview as the primary path for HWP as well. The
+            # intended UX is "show the LibreOffice/H2Orestart-converted PDF";
+            # the embedded HWP preview image is only a last-resort fallback for
+            # cases where conversion truly produced no usable PDF.
             preview_path = self.manager.get_document_preview_pdf_path(document_id=document_id, source_name=source_name)
             if preview_path:
                 self._serve_file(preview_path)
                 return
-            if source_path:
+            preview_image_path = self.manager.get_document_preview_image_path(
+                document_id=document_id,
+                source_name=source_name,
+            )
+            if preview_image_path:
+                self._serve_file(preview_image_path)
+                return
+            if source_path and source_path.suffix.lower() == ".pdf":
                 self._serve_file(source_path)
                 return
-            self._send_json({"error": "document_original_not_found"}, status=404)
+            self._send_json(
+                {
+                    "error": "document_preview_not_available",
+                    "document_id": document_id,
+                    "source_name": source_name,
+                },
+                status=404,
+            )
         except Exception as error:
             log_server_exception(f"GET {self.path}", error)
             self._send_json({"error": str(error)}, status=500)
+
+    def _handle_document_element_preview(self) -> None:
+        try:
+            query = parse_qs(urlparse(self.path).query)
+            document_id = str((query.get("document_id") or [""])[0]).strip()
+            source_name = str((query.get("source_name") or [""])[0]).strip()
+            element_id = str((query.get("element_id") or [""])[0]).strip()
+            raw_page_number = str((query.get("page_number") or [""])[0]).strip()
+            raw_bbox = str((query.get("bbox") or [""])[0]).strip()
+            if (not document_id and not source_name) or (not element_id and (not raw_page_number or not raw_bbox)):
+                self._send_json({"error": "document_selector_and_preview_target_required"}, status=400)
+                return
+
+            payload = self.manager.get_document_payload(document_id=document_id, source_name=source_name)
+            if not payload:
+                self._send_json({"error": "document_not_found"}, status=404)
+                return
+
+            if element_id:
+                page_number, bbox = self._find_payload_element_bbox(payload, element_id=element_id)
+            else:
+                try:
+                    page_number = int(raw_page_number or 0)
+                except (TypeError, ValueError):
+                    page_number = 0
+                bbox = self._parse_preview_bbox(raw_bbox)
+            if page_number <= 0 or bbox is None:
+                self._send_json({"error": "document_element_not_found"}, status=404)
+                return
+
+            preview_pdf_path = self._resolve_document_element_preview_pdf_path(
+                payload,
+                document_id=document_id,
+                source_name=source_name,
+            )
+            if not preview_pdf_path:
+                self._send_json({"error": "pdf_source_required_for_preview"}, status=404)
+                return
+
+            body = self._render_pdf_element_preview(preview_pdf_path, page_number=page_number, bbox=bbox)
+            self._send_binary(body, content_type="image/png")
+        except ValueError as error:
+            self._send_json({"error": str(error)}, status=400)
+        except Exception as error:
+            log_server_exception(f"GET {self.path}", error)
+            self._send_json({"error": str(error)}, status=500)
+
+    def _resolve_document_element_preview_pdf_path(
+        self,
+        payload: dict[str, object],
+        *,
+        document_id: str,
+        source_name: str,
+    ) -> Path | None:
+        source_path = self.manager.get_document_source_path(document_id=document_id, source_name=source_name)
+        if source_path and source_path.suffix.lower() == ".pdf":
+            return source_path
+
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        supporting_pdf = metadata.get("supporting_pdf") if isinstance(metadata.get("supporting_pdf"), dict) else {}
+        conversion = supporting_pdf.get("conversion") if isinstance(supporting_pdf.get("conversion"), dict) else {}
+        converted_pdf_raw = str(conversion.get("converted_pdf_path") or "").strip()
+        if converted_pdf_raw:
+            converted_pdf_path = Path(converted_pdf_raw)
+            if not converted_pdf_path.is_absolute():
+                converted_pdf_path = (ROOT / converted_pdf_path).resolve()
+            else:
+                converted_pdf_path = converted_pdf_path.resolve()
+            if converted_pdf_path.exists() and converted_pdf_path.suffix.lower() == ".pdf":
+                return converted_pdf_path
+
+        preview_pdf_path = self.manager.get_document_preview_pdf_path(
+            document_id=document_id,
+            source_name=source_name,
+        )
+        if preview_pdf_path and preview_pdf_path.exists() and preview_pdf_path.suffix.lower() == ".pdf":
+            return preview_pdf_path
+        return None
+
+    def _find_payload_element_bbox(
+        self,
+        payload: dict[str, object],
+        *,
+        element_id: str,
+    ) -> tuple[int, list[float] | None]:
+        for page_collection_name in ("pages", "asset_pages"):
+            pages = payload.get(page_collection_name) if isinstance(payload.get(page_collection_name), list) else []
+            for page in pages:
+                if not isinstance(page, dict):
+                    continue
+                try:
+                    page_number = int(page.get("page_number") or 0)
+                except (TypeError, ValueError):
+                    page_number = 0
+                elements = page.get("elements") if isinstance(page.get("elements"), list) else []
+                for element in elements:
+                    if not isinstance(element, dict):
+                        continue
+                    if str(element.get("element_id") or "").strip() != element_id:
+                        continue
+                    bbox = element.get("bbox")
+                    if not isinstance(bbox, list) or len(bbox) != 4:
+                        return page_number, None
+                    try:
+                        return page_number, [float(value) for value in bbox]
+                    except (TypeError, ValueError):
+                        return page_number, None
+        return 0, None
+
+    def _render_pdf_element_preview(
+        self,
+        source_path: Path,
+        *,
+        page_number: int,
+        bbox: list[float],
+    ) -> bytes:
+        if page_number <= 0:
+            raise ValueError("invalid_page_number")
+        if len(bbox) != 4:
+            raise ValueError("invalid_bbox")
+
+        with fitz.open(source_path) as document:
+            if page_number > document.page_count:
+                raise ValueError("page_out_of_range")
+            page = document[page_number - 1]
+            rect = fitz.Rect(*(float(value) for value in bbox))
+            if rect.is_empty or rect.width <= 0 or rect.height <= 0:
+                raise ValueError("invalid_bbox")
+
+            padding = max(10.0, min(rect.width, rect.height) * 0.08)
+            clip = fitz.Rect(rect.x0 - padding, rect.y0 - padding, rect.x1 + padding, rect.y1 + padding) & page.rect
+            if clip.is_empty or clip.width <= 0 or clip.height <= 0:
+                raise ValueError("invalid_bbox")
+
+            longest_edge = max(float(clip.width), float(clip.height), 1.0)
+            scale = min(3.0, max(1.5, 720.0 / longest_edge))
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
+            if pixmap.colorspace is not None and pixmap.colorspace.n > 3:
+                pixmap = fitz.Pixmap(fitz.csRGB, pixmap)
+            return pixmap.tobytes("png")
+
+    def _parse_preview_bbox(self, raw_bbox: str) -> list[float] | None:
+        parts = [part.strip() for part in str(raw_bbox or "").split(",") if part.strip()]
+        if len(parts) != 4:
+            return None
+        try:
+            return [float(part) for part in parts]
+        except (TypeError, ValueError):
+            return None
+
+    def _decorate_query_payload(self, payload: dict[str, object]) -> dict[str, object]:
+        citations = payload.get("citations") if isinstance(payload.get("citations"), list) else []
+        if not citations:
+            return payload
+
+        enriched = dict(payload)
+        updated_citations: list[dict[str, object]] = []
+        for citation in citations:
+            if not isinstance(citation, dict):
+                continue
+            updated_citation = dict(citation)
+            document_id = str(updated_citation.get("document_id") or "")
+            source_name = str(updated_citation.get("source_name") or "")
+            supporting_assets = updated_citation.get("supporting_assets") if isinstance(updated_citation.get("supporting_assets"), list) else []
+            updated_assets: list[dict[str, object]] = []
+            for asset in supporting_assets:
+                if not isinstance(asset, dict):
+                    continue
+                updated_asset = dict(asset)
+                element_id = str(updated_asset.get("element_id") or "")
+                page_number = 0
+                try:
+                    page_number = int(updated_asset.get("page_number") or 0)
+                except (TypeError, ValueError):
+                    page_number = 0
+                bbox = updated_asset.get("preview_bbox") if isinstance(updated_asset.get("preview_bbox"), list) else (
+                    updated_asset.get("bbox") if isinstance(updated_asset.get("bbox"), list) else None
+                )
+                if document_id and element_id:
+                    updated_asset["preview_url"] = (
+                        "/api/document-element-preview?document_id={document_id}&source_name={source_name}&element_id={element_id}".format(
+                            document_id=quote(document_id),
+                            source_name=quote(source_name),
+                            element_id=quote(element_id),
+                        )
+                    )
+                elif document_id and page_number > 0 and isinstance(bbox, list) and len(bbox) == 4:
+                    bbox_value = ",".join(str(float(value)) for value in bbox)
+                    updated_asset["preview_url"] = (
+                        "/api/document-element-preview?document_id={document_id}&source_name={source_name}&page_number={page_number}&bbox={bbox}".format(
+                            document_id=quote(document_id),
+                            source_name=quote(source_name),
+                            page_number=page_number,
+                            bbox=quote(bbox_value),
+                        )
+                    )
+                updated_assets.append(updated_asset)
+            updated_citation["supporting_assets"] = updated_assets
+            updated_citations.append(updated_citation)
+        enriched["citations"] = updated_citations
+        return enriched
 
     def _build_cached_summary_payload(
         self,
@@ -2969,12 +3279,13 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
         default_source_name: str = "",
     ) -> dict[str, object] | None:
         ui_summary = payload.get("ui_summary")
-        if isinstance(ui_summary, dict) and ui_summary:
+        if _is_llm_summary_payload(ui_summary):
             return {
                 "document_id": payload.get("document_id", default_document_id),
                 "source_name": payload.get("source_name", default_source_name),
                 "summary_text": ui_summary.get("summary_text", ""),
                 "key_points": ui_summary.get("key_points") or ui_summary.get("highlights") or [],
+                "page_summaries": ui_summary.get("page_summaries") or [],
                 "document_type": (
                     ui_summary.get("document_type")
                     or (payload.get("classification") or {}).get("document_type", "")
@@ -2984,14 +3295,14 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
                 "framework": ui_summary.get("framework") or "langchain",
                 "summary_source": ui_summary.get("summary_source") or "cached_ui_summary",
             }
-
         llm_summary = payload.get("llm_summary")
-        if isinstance(llm_summary, dict) and llm_summary:
+        if _is_llm_summary_payload(llm_summary):
             return {
                 "document_id": payload.get("document_id", default_document_id),
                 "source_name": payload.get("source_name", default_source_name),
                 "summary_text": llm_summary.get("summary_text", ""),
                 "key_points": llm_summary.get("key_points") or llm_summary.get("highlights") or [],
+                "page_summaries": ui_summary.get("page_summaries") if isinstance(ui_summary, dict) else [],
                 "document_type": (
                     llm_summary.get("document_type")
                     or (payload.get("classification") or {}).get("document_type", "")
@@ -2999,7 +3310,7 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
                 ),
                 "used_model": llm_summary.get("used_model") or "cached_llm_summary",
                 "framework": llm_summary.get("framework") or "pipeline_llm_summary",
-                "summary_source": "pipeline_llm_summary",
+                "summary_source": llm_summary.get("summary_source") or "pipeline_llm_summary",
             }
         return None
 
@@ -3012,6 +3323,9 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
     ) -> dict[str, object] | None:
         if not payload:
             return None
+        page_summaries = payload.get("page_summaries") if isinstance(payload.get("page_summaries"), list) else []
+        if not page_summaries:
+            page_summaries = build_page_summaries(payload)
         basic_summary = payload.get("basic_summary")
         if not isinstance(basic_summary, dict) or not basic_summary:
             return None
@@ -3020,6 +3334,7 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             "source_name": payload.get("source_name", source_name),
             "summary_text": basic_summary.get("summary_text", ""),
             "key_points": basic_summary.get("key_points") or basic_summary.get("highlights") or [],
+            "page_summaries": page_summaries,
             "document_type": (
                 basic_summary.get("document_type")
                 or (payload.get("classification") or {}).get("document_type", "")
@@ -3055,7 +3370,19 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
         basic_summary = payload.get("basic_summary") if isinstance(payload.get("basic_summary"), dict) else {}
         llm_summary = payload.get("llm_summary") if isinstance(payload.get("llm_summary"), dict) else {}
         ui_summary = payload.get("ui_summary") if isinstance(payload.get("ui_summary"), dict) else {}
-        preferred_summary = ui_summary or llm_summary or basic_summary or {}
+        preferred_summary = ui_summary if _is_llm_summary_payload(ui_summary) else llm_summary if _is_llm_summary_payload(llm_summary) else basic_summary
+        document_id = str(payload.get("document_id", "")).strip()
+        source_name = str(payload.get("source_name", "")).strip()
+        original_preview_kind = "pdf"
+        preview_pdf_path = self.manager.get_document_preview_pdf_path(
+            document_id=document_id,
+            source_name=source_name,
+        )
+        if preview_pdf_path is None and self.manager.get_document_preview_image_path(
+            document_id=document_id,
+            source_name=source_name,
+        ) is not None:
+            original_preview_kind = "image"
         viewer_markdown = enrich_pdf_markdown_for_viewer(payload, str(payload.get("markdown") or ""))
         sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
         normalized_sections = []
@@ -3089,19 +3416,27 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             )
         normalized_chunks = _infer_semantic_chunk_page_numbers(payload, normalized_chunks)
         key_points = preferred_summary.get("key_points") or preferred_summary.get("highlights") or []
+        raw_page_summaries = ui_summary.get("page_summaries") if isinstance(ui_summary.get("page_summaries"), list) else []
+        if not _has_llm_page_summaries(raw_page_summaries):
+            raw_page_summaries = llm_summary.get("page_summaries") if isinstance(llm_summary.get("page_summaries"), list) else []
+        if not _has_llm_page_summaries(raw_page_summaries):
+            raw_page_summaries = payload.get("page_summaries") if isinstance(payload.get("page_summaries"), list) else []
+        page_summaries = _normalize_page_summary_items(raw_page_summaries)
         return {
-            "document_id": payload.get("document_id", ""),
-            "source_name": payload.get("source_name", ""),
+            "document_id": document_id,
+            "source_name": source_name,
             "document_type": (payload.get("classification") or {}).get("document_type", "") or payload.get("extension", ""),
             "origin": payload.get("origin", ""),
             "summary_text": preferred_summary.get("summary_text", ""),
             "key_points": [str(item).strip() for item in key_points if str(item).strip()][:6],
+            "page_summaries": page_summaries,
             "section_titles": normalized_sections,
             "markdown": clean_viewer_markdown(viewer_markdown),
             "semantic_chunks": normalized_chunks,
+            "original_preview_kind": original_preview_kind,
             "original_url": "/api/document-original?document_id={document_id}&source_name={source_name}".format(
-                document_id=quote(str(payload.get("document_id", ""))),
-                source_name=quote(str(payload.get("source_name", ""))),
+                document_id=quote(document_id),
+                source_name=quote(source_name),
             ),
             "extension": str(payload.get("extension") or ""),
         }
@@ -3151,17 +3486,14 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
             if not query:
                 self._send_json({"error": "query_is_required"}, status=400)
                 return
-            request_retriever = ChromaRetriever(project_root=ROOT)
-            try:
-                answer = request_retriever.answer_question(
-                    query=query,
-                    strategy=strategy,
-                    document_id=document_id,
-                    source_name=source_name,
-                    document_ids=selected_document_ids,
-                )
-            finally:
-                request_retriever.close()
+            answer = self.retriever.answer_question(
+                query=query,
+                strategy=strategy,
+                document_id=document_id,
+                source_name=source_name,
+                document_ids=selected_document_ids,
+            )
+            answer = self._decorate_query_payload(answer)
         except ValueError as error:
             self._send_json({"error": str(error)}, status=400)
             return
@@ -3381,6 +3713,16 @@ class DocumentStudioRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.error):
             return
 
+    def _send_binary(self, payload: bytes, *, content_type: str, status: int = 200) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.error):
+            return
+
     def _serve_file(self, path: Path) -> None:
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         try:
@@ -3404,7 +3746,6 @@ def main() -> int:
     manager = ReviewSessionManager(project_root=ROOT)
     retriever = ChromaRetriever(project_root=ROOT)
     langchain_service = LazyLangChainService(project_root=ROOT)
-    langchain_service.start_background_warmup(preload_summaries=True)
 
     handler = partial(
         DocumentStudioRequestHandler,
@@ -3417,7 +3758,6 @@ def main() -> int:
     url = f"http://{args.host}:{args.port}/"
     print(f"Serving Document Studio from: {ROOT}")
     print(f"Open: {url}")
-    print("LangChain warmup started in background.")
 
     try:
         server.serve_forever()

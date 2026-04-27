@@ -45,6 +45,8 @@ ENHANCED_DISCLAIMER_PATTERN = re.compile(
     r"(?:forward-looking statement(?:s)?|important notice|not be relied upon)",
     re.IGNORECASE,
 )
+RECORDSET_KV_PATTERN = re.compile(r"^(?P<label>[^:\n|]{1,40})\s*:\s*(?P<value>.*?)\s*$")
+RECORDSET_DATE_INT_PATTERN = re.compile(r"^(?P<date>\d{4}[./-]\d{1,2}[./-]\d{1,2})\s+(?P<count>\d{1,4})$")
 PICTURE_TEXT_MARKER_PATTERN = re.compile(
     r"start of picture (?:ocr|text)|end of picture (?:ocr|text)",
     re.IGNORECASE,
@@ -158,6 +160,8 @@ class PdfMarkdownPreprocessor:
             "series_rows_structured": 0,
             "financial_tables_structured": 0,
             "financial_fact_rows_structured": 0,
+            "recordset_tables_structured": 0,
+            "recordset_rows_structured": 0,
             "chart_clusters_collapsed": 0,
             "chart_cluster_items_compacted": 0,
             "candidate_lines": 0,
@@ -197,6 +201,7 @@ class PdfMarkdownPreprocessor:
                 ("compact-toc-page", total_counts["toc_entries_compacted"]),
                 ("structure-series-table", total_counts["series_tables_structured"]),
                 ("structure-financial-table", total_counts["financial_tables_structured"]),
+                ("structure-recordset-table", total_counts["recordset_tables_structured"]),
             )
             if count
         ]
@@ -235,7 +240,9 @@ class PdfMarkdownPreprocessor:
                         f"series tables {total_counts['series_tables_structured']}, "
                         f"series rows {total_counts['series_rows_structured']}, "
                         f"financial tables {total_counts['financial_tables_structured']}, "
-                        f"financial fact rows {total_counts['financial_fact_rows_structured']}."
+                        f"financial fact rows {total_counts['financial_fact_rows_structured']}, "
+                        f"recordset tables {total_counts['recordset_tables_structured']}, "
+                        f"recordset rows {total_counts['recordset_rows_structured']}."
                     ),
                     severity="info",
                 )
@@ -463,12 +470,15 @@ class PdfMarkdownPreprocessor:
             "series_rows_structured": 0,
             "financial_tables_structured": 0,
             "financial_fact_rows_structured": 0,
+            "recordset_tables_structured": 0,
+            "recordset_rows_structured": 0,
             "chart_clusters_collapsed": 0,
             "chart_cluster_items_compacted": 0,
             "candidate_lines": 0,
             "preserved_candidate_lines": 0,
             "paragraph_merges": 0,
             "financial_table_rule_hits": {},
+            "recordset_rule_hits": {},
             "removals": [],
             "preserved_candidates": [],
         }
@@ -521,6 +531,7 @@ class PdfMarkdownPreprocessor:
             kept_lines.append(normalized_line)
 
         rewritten = self._compact_blank_lines(kept_lines)
+        rewritten = self._structure_recordset_blocks(rewritten, summary)
         rewritten = self._merge_paragraph_lines(rewritten, summary)
         rewritten = self._compact_toc_page(rewritten, repeated_catalog, summary)
         rewritten = self._structure_series_blocks(rewritten, summary)
@@ -1312,7 +1323,7 @@ class PdfMarkdownPreprocessor:
                 block_lines.append(lines[index].strip())
                 index += 1
 
-            rendered = self._try_render_financial_table_block(block_lines, summary)
+            rendered = self._try_render_financial_table_block_with_rules(block_lines, summary)
             if rendered is None:
                 rewritten.extend(lines[start:index])
                 continue
@@ -1321,92 +1332,6 @@ class PdfMarkdownPreprocessor:
             rewritten.append("")
 
         return self._compact_blank_lines(rewritten)
-
-    def _try_render_financial_table_block(self, block_lines: list[str], summary: dict[str, Any]) -> list[str] | None:
-        rows = [self._parse_markdown_table_row(line) for line in block_lines]
-        rows = [row for row in rows if row]
-        if len(rows) < 3:
-            return None
-
-        non_separator_rows = [row for row in rows if not self._is_markdown_separator_row(row)]
-        if len(non_separator_rows) < 3:
-            return None
-
-        title_row = non_separator_rows[0]
-        header_row = non_separator_rows[1]
-        data_rows = non_separator_rows[2:]
-        if len(header_row) < 3 or len(data_rows) < 2:
-            return None
-
-        period_groups = [self._split_table_cell(cell) for cell in header_row[1:]]
-        pure_period_columns = [group for group in period_groups if group and all(self._looks_like_financial_period_token(token) for token in group)]
-        if len(pure_period_columns) < 4:
-            return None
-
-        title = self._normalize_inline_markdown(" ".join(cell for cell in title_row if cell.strip()))
-        unit = self._extract_unit_from_title(title)
-        rendered = [f"**[Financial Fact Table]** {title}" if title else "**[Financial Fact Table]**"]
-        if unit:
-            rendered.append(f"(Unit: {unit})")
-
-        pending_labels: dict[int, list[str]] = {}
-        fact_rows: list[FactRow] = []
-
-        for row in data_rows:
-            current_labels = self._split_table_cell(row[0]) if row else []
-            if current_labels:
-                current_labels = [label for label in current_labels if label not in {"구분", "회사잠정", "(십억원)"}]
-
-            for column_index in range(1, len(row)):
-                periods = period_groups[column_index - 1] if column_index - 1 < len(period_groups) else []
-                values = self._split_table_cell(row[column_index])
-                if not periods or not values:
-                    continue
-
-                labels_for_column = current_labels if current_labels else pending_labels.get(column_index, [])
-                if not labels_for_column:
-                    continue
-
-                fact_group = self._build_fact_rows(labels_for_column, periods, values)
-                if not fact_group:
-                    continue
-
-                fact_rows.extend(fact_group)
-                covered = len(fact_group)
-                if current_labels:
-                    remainder = current_labels[covered:]
-                else:
-                    remainder = labels_for_column[covered:]
-
-                if remainder:
-                    pending_labels[column_index] = remainder
-                else:
-                    pending_labels.pop(column_index, None)
-
-        merged_fact_rows: list[FactRow] = []
-        fact_row_lookup: dict[str, FactRow] = {}
-        for fact_row in fact_rows:
-            existing = fact_row_lookup.get(fact_row.label)
-            if existing is None:
-                merged = FactRow(label=fact_row.label, facts=list(fact_row.facts))
-                fact_row_lookup[fact_row.label] = merged
-                merged_fact_rows.append(merged)
-                continue
-            existing.facts.extend(fact_row.facts)
-
-        if len(merged_fact_rows) < 3:
-            return None
-
-        for fact_row in merged_fact_rows:
-            rendered.append(f"- {fact_row.label}: " + " | ".join(f"{period}={value}" for period, value in fact_row.facts))
-
-        summary["financial_tables_structured"] += 1
-        summary["financial_fact_rows_structured"] += len(merged_fact_rows)
-        rule_hits = summary.setdefault("financial_table_rule_hits", {})
-        if isinstance(rule_hits, dict):
-            rule_hits["hierarchical_periodic_table"] = int(rule_hits.get("hierarchical_periodic_table", 0) or 0) + 1
-        summary["changed"] = True
-        return rendered
 
     def _parse_markdown_table_row(self, line: str) -> list[str]:
         stripped = line.strip()
@@ -1444,24 +1369,6 @@ class PdfMarkdownPreprocessor:
         if match:
             return match.group(1).strip()
         return None
-
-    def _build_fact_rows(self, labels: list[str], periods: list[str], values: list[str]) -> list[FactRow]:
-        width = len(periods)
-        if not labels or not periods or len(values) < width:
-            return []
-
-        row_count = min(len(labels), len(values) // width)
-        fact_rows: list[FactRow] = []
-        for row_index in range(row_count):
-            label = self._normalize_fact_label(labels[row_index])
-            if not label:
-                continue
-            start = row_index * width
-            row_values = values[start : start + width]
-            if len(row_values) != width:
-                continue
-            fact_rows.append(FactRow(label=label, facts=list(zip(periods, row_values))))
-        return fact_rows
 
     def _normalize_fact_label(self, label: str) -> str:
         cleaned = self._normalize_inline_markdown(label)
@@ -1626,6 +1533,428 @@ class PdfMarkdownPreprocessor:
             rule_hits["packed_period_summary_table"] = int(rule_hits.get("packed_period_summary_table", 0) or 0) + 1
         summary["changed"] = True
         return rendered
+
+    def _try_render_financial_table_block_with_rules(
+        self,
+        block_lines: list[str],
+        summary: dict[str, Any],
+    ) -> list[str] | None:
+        rows = [self._parse_markdown_table_row(line) for line in block_lines]
+        rows = [row for row in rows if row]
+        if len(rows) < 3:
+            return None
+
+        non_separator_rows = [row for row in rows if not self._is_markdown_separator_row(row)]
+        if len(non_separator_rows) < 3:
+            return None
+
+        title_row = non_separator_rows[0]
+        header_row = non_separator_rows[1]
+        data_rows = non_separator_rows[2:]
+        if len(header_row) < 3 or len(data_rows) < 2:
+            return None
+
+        period_groups = [self._split_table_cell(cell) for cell in header_row[1:]]
+        pure_period_columns = [
+            group
+            for group in period_groups
+            if group and all(self._looks_like_financial_period_token(token) for token in group)
+        ]
+        if len(pure_period_columns) < 4:
+            return None
+
+        title = self._normalize_inline_markdown(" ".join(cell for cell in title_row if cell.strip()))
+        unit = self._extract_unit_from_title(title)
+        base_rendered = [f"**[Financial Fact Table]** {title}" if title else "**[Financial Fact Table]**"]
+        if unit:
+            base_rendered.append(f"(Unit: {unit})")
+
+        packed_rendered = self._try_render_packed_period_table(
+            data_rows=data_rows,
+            period_groups=period_groups,
+            base_rendered=base_rendered,
+            summary={},
+        )
+        if packed_rendered is not None and self._has_sufficient_financial_fact_coverage(
+            self._extract_rendered_fact_rows(packed_rendered),
+            period_groups,
+            title,
+        ):
+            self._record_financial_table_hit(summary, "packed_period_summary_table", packed_rendered)
+            return packed_rendered
+
+        hierarchical_rendered = self._try_render_hierarchical_period_table_with_fallback(
+            data_rows=data_rows,
+            period_groups=period_groups,
+            base_rendered=base_rendered,
+            title=title,
+        )
+        if hierarchical_rendered is not None:
+            self._record_financial_table_hit(summary, "hierarchical_periodic_table", hierarchical_rendered)
+            return hierarchical_rendered
+
+        return None
+
+    def _structure_recordset_blocks(self, lines: list[str], summary: dict[str, Any]) -> list[str]:
+        if not lines:
+            return lines
+
+        rewritten: list[str] = []
+        index = 0
+        active_schema: list[str] | None = None
+
+        while index < len(lines):
+            record, labels, next_index = self._parse_explicit_record_block(lines, index)
+            if record is not None:
+                schema = labels
+                records = [record]
+                cursor = next_index
+                implicit_count = 0
+
+                while cursor < len(lines):
+                    while cursor < len(lines) and not lines[cursor].strip():
+                        cursor += 1
+                    implicit_record, implicit_next = self._parse_implicit_record_block(lines, cursor, schema)
+                    if implicit_record is not None:
+                        records.append(implicit_record)
+                        implicit_count += 1
+                        cursor = implicit_next
+                        continue
+
+                    explicit_record, explicit_labels, explicit_next = self._parse_explicit_record_block(lines, cursor)
+                    if explicit_record is None or explicit_labels != schema:
+                        break
+                    records.append(explicit_record)
+                    cursor = explicit_next
+
+                if len(records) >= 2:
+                    rewritten.extend(self._render_recordset_table(schema, records))
+                    rewritten.append("")
+                    self._record_recordset_hit(summary, "explicit_recordset_table", len(records))
+                    active_schema = schema
+                    index = cursor
+                    continue
+
+            if active_schema is not None:
+                probe = index
+                while probe < len(lines) and not lines[probe].strip():
+                    rewritten.append(lines[probe])
+                    probe += 1
+                if probe != index:
+                    index = probe
+                    if index >= len(lines):
+                        break
+
+                implicit_record, implicit_next = self._parse_implicit_record_block(lines, index, active_schema)
+                if implicit_record is not None:
+                    records = [implicit_record]
+                    cursor = implicit_next
+                    while cursor < len(lines):
+                        while cursor < len(lines) and not lines[cursor].strip():
+                            cursor += 1
+                        candidate, candidate_next = self._parse_implicit_record_block(lines, cursor, active_schema)
+                        if candidate is None:
+                            break
+                        records.append(candidate)
+                        cursor = candidate_next
+
+                    rewritten.extend(self._render_recordset_table(active_schema, records))
+                    rewritten.append("")
+                    self._record_recordset_hit(summary, "implicit_recordset_table", len(records))
+                    index = cursor
+                    continue
+
+            rewritten.append(lines[index])
+            stripped = lines[index].strip()
+            if stripped.startswith("#"):
+                active_schema = None
+            index += 1
+
+        return self._compact_blank_lines(rewritten)
+
+    def _parse_explicit_record_block(
+        self,
+        lines: list[str],
+        start_index: int,
+    ) -> tuple[dict[str, Any] | None, list[str], int]:
+        if start_index >= len(lines):
+            return None, [], start_index
+
+        stripped = lines[start_index].strip()
+        if not stripped or stripped.startswith("|") or stripped.startswith("#"):
+            return None, [], start_index
+
+        labels: list[str] = []
+        values: dict[str, str] = {}
+        list_values: dict[str, list[str]] = {}
+        active_list_label: str | None = None
+        index = start_index
+
+        while index < len(lines):
+            stripped = lines[index].strip()
+            if not stripped:
+                if labels:
+                    index += 1
+                    break
+                return None, [], start_index
+            if stripped.startswith("#") or stripped.startswith("|"):
+                break
+
+            match = RECORDSET_KV_PATTERN.match(stripped)
+            if match is not None:
+                label = self._normalize_inline_markdown(match.group("label"))
+                value = self._normalize_inline_markdown(match.group("value"))
+                if not label:
+                    break
+                labels.append(label)
+                values[label] = value
+                active_list_label = label if not value else None
+                index += 1
+                continue
+
+            if stripped in {"[", "]"}:
+                index += 1
+                continue
+
+            if active_list_label and stripped.startswith(("*", "-", "•")):
+                list_values.setdefault(active_list_label, []).append(self._normalize_recordset_item(stripped))
+                index += 1
+                continue
+
+            if active_list_label and stripped and RECORDSET_KV_PATTERN.match(stripped) is None:
+                normalized = self._normalize_recordset_item(stripped)
+                if normalized:
+                    list_values.setdefault(active_list_label, []).append(normalized)
+                    index += 1
+                    continue
+
+            break
+
+        if len(labels) < 2:
+            return None, [], start_index
+        return {"values": values, "list_values": list_values}, labels, index
+
+    def _parse_implicit_record_block(
+        self,
+        lines: list[str],
+        start_index: int,
+        schema: list[str],
+    ) -> tuple[dict[str, Any] | None, int]:
+        if start_index >= len(lines) or len(schema) < 3:
+            return None, start_index
+
+        stripped = lines[start_index].strip()
+        match = RECORDSET_DATE_INT_PATTERN.match(stripped)
+        if match is None:
+            return None, start_index
+
+        record = {
+            "values": {
+                schema[0]: match.group("date"),
+                schema[1]: match.group("count"),
+            },
+            "list_values": {},
+        }
+
+        index = start_index + 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+
+        items: list[str] = []
+        while index < len(lines):
+            stripped = lines[index].strip()
+            if not stripped:
+                index += 1
+                break
+            if stripped.startswith("#") or stripped.startswith("|"):
+                break
+            if RECORDSET_DATE_INT_PATTERN.match(stripped) is not None:
+                break
+            if RECORDSET_KV_PATTERN.match(stripped) is not None:
+                break
+
+            if stripped.startswith(("*", "-", "•")):
+                items.append(self._normalize_recordset_item(stripped))
+            else:
+                normalized = self._normalize_recordset_item(stripped)
+                if normalized:
+                    items.append(normalized)
+            index += 1
+
+        if not items:
+            return None, start_index
+        record["list_values"][schema[2]] = items
+        return record, index
+
+    def _normalize_recordset_item(self, text: str) -> str:
+        normalized = text.strip()
+        normalized = re.sub(r"^(?:[-*•]\s+|[.\-]+\s*)", "", normalized)
+        return self._normalize_inline_markdown(normalized)
+
+    def _render_recordset_table(self, schema: list[str], records: list[dict[str, Any]]) -> list[str]:
+        rendered = [
+            "| " + " | ".join(schema) + " |",
+            "| " + " | ".join("---" for _ in schema) + " |",
+        ]
+        for record in records:
+            values = record.get("values") if isinstance(record.get("values"), dict) else {}
+            list_values = record.get("list_values") if isinstance(record.get("list_values"), dict) else {}
+            row: list[str] = []
+            for label in schema:
+                items = list_values.get(label)
+                if isinstance(items, list) and items:
+                    row.append("<br>".join(item for item in items if item))
+                else:
+                    row.append(str(values.get(label) or "").strip())
+            rendered.append("| " + " | ".join(row) + " |")
+        return rendered
+
+    def _record_recordset_hit(self, summary: dict[str, Any], rule_name: str, row_count: int) -> None:
+        summary["recordset_tables_structured"] += 1
+        summary["recordset_rows_structured"] += row_count
+        rule_hits = summary.setdefault("recordset_rule_hits", {})
+        if isinstance(rule_hits, dict):
+            rule_hits[rule_name] = int(rule_hits.get(rule_name, 0) or 0) + 1
+        summary["changed"] = True
+
+    def _try_render_hierarchical_period_table_with_fallback(
+        self,
+        *,
+        data_rows: list[list[str]],
+        period_groups: list[list[str]],
+        base_rendered: list[str],
+        title: str,
+    ) -> list[str] | None:
+        current_root_label: str | None = None
+        pending_paths: dict[int, list[list[str]]] = {}
+        fact_rows: list[FactRow] = []
+
+        for row in data_rows:
+            current_labels = self._split_table_cell(row[0]) if row else []
+            if current_labels:
+                current_labels = [
+                    label
+                    for label in current_labels
+                    if label not in {"구분", "회사잠정", "(십억원)"}
+                ]
+                current_paths, current_root_label = self._build_row_paths(current_labels, current_root_label)
+            else:
+                current_paths = []
+
+            for column_index in range(1, len(row)):
+                periods = period_groups[column_index - 1] if column_index - 1 < len(period_groups) else []
+                values = self._split_table_cell(row[column_index])
+                if not periods or not values:
+                    continue
+
+                paths_for_column = current_paths if current_paths else pending_paths.get(column_index, [])
+                if not paths_for_column:
+                    continue
+
+                fact_group = self._build_fact_rows(paths_for_column, periods, values)
+                if not fact_group:
+                    continue
+
+                fact_rows.extend(fact_group)
+                covered = len(fact_group)
+                remainder = current_paths[covered:] if current_paths else paths_for_column[covered:]
+                if remainder:
+                    pending_paths[column_index] = remainder
+                else:
+                    pending_paths.pop(column_index, None)
+
+        merged_fact_rows: list[FactRow] = []
+        fact_row_lookup: dict[str, FactRow] = {}
+        for fact_row in fact_rows:
+            lookup_key = " > ".join(fact_row.row_path)
+            existing = fact_row_lookup.get(lookup_key)
+            if existing is None:
+                merged = FactRow(row_path=list(fact_row.row_path), facts=list(fact_row.facts))
+                fact_row_lookup[lookup_key] = merged
+                merged_fact_rows.append(merged)
+                continue
+            existing.facts.extend(fact_row.facts)
+
+        if len(merged_fact_rows) < 3:
+            return None
+        if not self._has_sufficient_financial_fact_coverage(merged_fact_rows, period_groups, title):
+            return None
+
+        rendered = list(base_rendered)
+        for fact_row in merged_fact_rows:
+            rendered.append(
+                f"- [row_path] {' > '.join(fact_row.row_path)}: "
+                + " | ".join(f"{period}={value}" for period, value in fact_row.facts)
+            )
+        return rendered
+
+    def _record_financial_table_hit(
+        self,
+        summary: dict[str, Any],
+        rule_name: str,
+        rendered: list[str],
+    ) -> None:
+        summary["financial_tables_structured"] += 1
+        summary["financial_fact_rows_structured"] += sum(1 for line in rendered if "[row_path]" in line.casefold())
+        rule_hits = summary.setdefault("financial_table_rule_hits", {})
+        if isinstance(rule_hits, dict):
+            rule_hits[rule_name] = int(rule_hits.get(rule_name, 0) or 0) + 1
+        summary["changed"] = True
+
+    def _extract_rendered_fact_rows(self, rendered: list[str]) -> list[FactRow]:
+        fact_rows: list[FactRow] = []
+        for line in rendered:
+            stripped = line.strip()
+            if "[row_path]" not in stripped:
+                continue
+            prefix, _, fact_text = stripped.partition(":")
+            if not fact_text:
+                continue
+            row_path_text = prefix.split("[row_path]", 1)[-1].strip()
+            row_path = [part.strip() for part in row_path_text.split(">") if part.strip()]
+            facts: list[tuple[str, str]] = []
+            for token in fact_text.split("|"):
+                period, sep, value = token.partition("=")
+                if not sep:
+                    continue
+                facts.append((period.strip(), value.strip()))
+            if row_path and facts:
+                fact_rows.append(FactRow(row_path=row_path, facts=facts))
+        return fact_rows
+
+    def _has_sufficient_financial_fact_coverage(
+        self,
+        fact_rows: list[FactRow],
+        period_groups: list[list[str]],
+        title: str,
+    ) -> bool:
+        if not fact_rows:
+            return False
+
+        expected_periods = sum(
+            len([token for token in group if self._looks_like_financial_period_token(token)])
+            for group in period_groups
+        )
+        if expected_periods < 4:
+            return False
+
+        minimum_facts = max(4, math.ceil(expected_periods * 0.6))
+        covered_rows = 0
+        sufficiently_wide_rows = 0
+        for fact_row in fact_rows:
+            if not fact_row.row_path:
+                continue
+            covered_rows += 1
+            if len(fact_row.facts) >= minimum_facts:
+                sufficiently_wide_rows += 1
+
+        if covered_rows < 3:
+            return False
+        if (sufficiently_wide_rows / covered_rows) < 0.6:
+            return False
+        if "실적" in title and covered_rows < 6:
+            return False
+        return True
 
     def _parse_packed_period_row(self, row: list[str], periods: list[str]) -> FactRow | None:
         if not row:
