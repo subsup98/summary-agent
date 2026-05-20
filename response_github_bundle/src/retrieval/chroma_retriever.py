@@ -59,7 +59,7 @@ class ChromaRetriever:
                 source_name=source_name,
                 document_ids=document_ids,
             )
-        n_results = top_k
+        n_results = max(top_k, min(top_k * 8, 40))
 
         try:
             query_embedding = self.embeddings.embed_query(query)
@@ -276,7 +276,7 @@ class ChromaRetriever:
 
             chunks = []
             if strategy == "semantic":
-                chunks = data.get("semantic_chunks") or []
+                chunks = data.get("hybrid_retrieval_chunks") or data.get("llm_ready_chunks") or data.get("semantic_chunks") or []
             if not chunks:
                 chunks = data.get("chunks") or data.get("semantic_chunks") or []
 
@@ -310,7 +310,12 @@ class ChromaRetriever:
                             "page_number": page_number,
                             "asset_page_number": chunk.get("asset_page_number"),
                             "chunk_index": chunk_index,
-                            "strategy": "structured_fallback",
+                            "strategy": chunk.get("strategy") or "structured_fallback",
+                            "chunk_type": chunk.get("chunk_type") or "",
+                            "semantic_type": chunk.get("semantic_type") or "",
+                            "retrieval_lane": chunk.get("retrieval_lane") or "",
+                            "region_id": chunk.get("region_id") or "",
+                            "chunk_id": chunk.get("chunk_id") or "",
                         },
                     }
                 )
@@ -340,12 +345,30 @@ class ChromaRetriever:
         numeric_overlap = len(self._extract_numeric_tokens(query) & self._extract_numeric_tokens(str(match.get("document") or "")))
         temporal_overlap = len(self._extract_temporal_tokens(query) & self._extract_temporal_tokens(str(match.get("document") or "")))
         overlap += numeric_overlap * 8 + temporal_overlap * 6
+        requested_pages = self._extract_requested_pages(query)
+        if requested_pages:
+            match_page = self._safe_int(self._metadata_page_number(metadata))
+            if match_page and match_page in requested_pages:
+                overlap += 30
+            elif match_page:
+                overlap -= 25
+        chunk_type = str(metadata.get("chunk_type") or "")
+        if chunk_type == "structured_relation":
+            overlap += 10
+        elif chunk_type == "clean_text":
+            overlap += 3
         if self._query_prefers_tabular_asset(query) and (not intent_tokens or intent_overlap > 0):
             overlap += self._table_query_match_bonus(query=query, match=match)
         elif intent_tokens and intent_overlap <= 0:
             overlap -= 12
         distance = float(match.get("distance", 9999.0) or 9999.0)
         return (-overlap, distance)
+
+    def _extract_requested_pages(self, query: str) -> set[int]:
+        pages = set()
+        for match in re.finditer(r"(?:페이지|page|p)\s*\.?\s*(\d{1,3})(?!\d)", str(query or ""), flags=re.IGNORECASE):
+            pages.add(int(match.group(1)))
+        return pages
 
     def _score_sentence_relevance(
         self,

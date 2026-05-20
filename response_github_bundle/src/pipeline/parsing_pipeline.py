@@ -22,6 +22,7 @@ from src.parsers.pdf.pdf_parser import PdfParser
 from src.parsers.text.text_parser import TextParser
 from src.indexing.chunking import build_semantic_chunks
 from src.indexing.embedding_backends import resolve_embedding_backend
+from src.indexing.llm_ready import build_llm_ready_artifacts
 from src.retrieval.document_summary import build_page_summaries, ensure_basic_summary
 from src.shared.io import ensure_directory, iso_now, make_artifact_stem, write_json, write_text
 from src.shared.office_pdf_converter import convert_office_source_to_pdf_with_diagnostics
@@ -46,6 +47,8 @@ class ParsingPipelineConfig:
     comparisons_root: Path | None = None
     reports_root: Path | None = None
     enable_omitted_picture_ocr: bool = True
+    markdown_mode: str = "both"
+    qa_mode: str = "hybrid"
     on_document_ready: Callable[[dict[str, Any]], None] | None = field(default=None, compare=False)
     max_workers: int = 4
 
@@ -452,6 +455,13 @@ class ParsingPipeline:
             semantic_chunk_started_perf = time.perf_counter()
             payload["semantic_chunks"] = build_semantic_chunks(chunking_markdown, embeddings=self.embedding_backend)
             semantic_chunk_seconds = round(time.perf_counter() - semantic_chunk_started_perf, 3)
+        payload["retrieval_config"] = {
+            "markdown_mode": self.config.markdown_mode,
+            "qa_mode": self.config.qa_mode,
+        }
+        if self.config.markdown_mode in {"both", "llm_ready"} or self.config.qa_mode in {"hybrid", "llm_ready"}:
+            llm_ready_artifacts = build_llm_ready_artifacts(payload, payload.get("semantic_chunks") or [])
+            payload.update(llm_ready_artifacts)
 
         record: dict[str, Any] = {
             "source_path": relative_path,
@@ -468,13 +478,18 @@ class ParsingPipeline:
             structured_path = self.config.structured_root / "documents" / f"{artifact_stem}.json"
             output_json_path = self.config.outputs_root / "json" / f"{artifact_stem}.json"
             output_markdown_path = self.config.outputs_root / "markdown" / f"{artifact_stem}.md"
+            output_llm_ready_markdown_path = self.config.outputs_root / "markdown" / f"{artifact_stem}.llm_ready.md"
 
             write_json(structured_path, payload)
             write_json(output_json_path, payload)
             write_text(output_markdown_path, markdown.rstrip() + "\n")
+            if payload.get("llm_ready_markdown"):
+                write_text(output_llm_ready_markdown_path, str(payload.get("llm_ready_markdown") or "").rstrip() + "\n")
 
             record["structured_path"] = structured_path.as_posix()
             record["markdown_path"] = output_markdown_path.as_posix()
+            if payload.get("llm_ready_markdown"):
+                record["llm_ready_markdown_path"] = output_llm_ready_markdown_path.as_posix()
             outcome = "parsed"
         else:
             fallback_path = self.config.interim_root / "fallbacks" / f"{artifact_stem}.json"

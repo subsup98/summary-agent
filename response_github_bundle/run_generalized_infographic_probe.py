@@ -5,94 +5,230 @@ import re
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
+from typing import Any
 
-from src.classifiers.document_classifier import classify_document
-from src.parsers.common.models import DocumentElement
-from src.parsers.pdf.pdf_parser import PdfParser
+import fitz
+
+from src.parsers.pdf.structtree_extractor import PowerPointStructTreeExtractor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "generalized_infographic_probe"
-
-YEAR_RE = re.compile(r"^20\d{2}$")
-PERCENT_RE = re.compile(r"^\d+(?:\.\d+)?%$")
-NUMBER_RE = re.compile(r"^\d{1,3}(?:,\d{3})*(?:\.\d+)?$")
-KOREAN_RE = re.compile(r"[가-힣]")
+PAGE_NUMBER = 16
+TOP_LIMIT = 315.0
 
 
-@dataclass
-class Token:
-    text: str
-    bbox: tuple[float, float, float, float]
-    element_type: str
+@dataclass(frozen=True)
+class Box:
+    x0: float
+    y0: float
+    x1: float
+    y1: float
 
     @property
-    def x0(self) -> float:
-        return self.bbox[0]
-
-    @property
-    def y0(self) -> float:
-        return self.bbox[1]
-
-    @property
-    def x1(self) -> float:
-        return self.bbox[2]
-
-    @property
-    def y1(self) -> float:
-        return self.bbox[3]
-
-    @property
-    def cx(self) -> float:
-        return (self.x0 + self.x1) / 2
-
-    @property
-    def cy(self) -> float:
-        return (self.y0 + self.y1) / 2
+    def width(self) -> float:
+        return max(0.0, self.x1 - self.x0)
 
     @property
     def height(self) -> float:
-        return self.y1 - self.y0
+        return max(0.0, self.y1 - self.y0)
+
+    @property
+    def area(self) -> float:
+        return self.width * self.height
+
+    @property
+    def cx(self) -> float:
+        return (self.x0 + self.x1) / 2.0
+
+    @property
+    def cy(self) -> float:
+        return (self.y0 + self.y1) / 2.0
+
+    def padded(self, amount: float) -> "Box":
+        return Box(self.x0 - amount, self.y0 - amount, self.x1 + amount, self.y1 + amount)
+
+    def intersects(self, other: "Box") -> bool:
+        return self.x0 <= other.x1 and self.x1 >= other.x0 and self.y0 <= other.y1 and self.y1 >= other.y0
+
+    def contains_center(self, other: "Box", *, pad: float = 0.0) -> bool:
+        return (
+            self.x0 - pad <= other.cx <= self.x1 + pad
+            and self.y0 - pad <= other.cy <= self.y1 + pad
+        )
+
+    def union(self, other: "Box") -> "Box":
+        return Box(
+            min(self.x0, other.x0),
+            min(self.y0, other.y0),
+            max(self.x1, other.x1),
+            max(self.y1, other.y1),
+        )
+
+    def to_list(self) -> list[float]:
+        return [round(self.x0, 3), round(self.y0, 3), round(self.x1, 3), round(self.y1, 3)]
+
+
+@dataclass(frozen=True)
+class Token:
+    text: str
+    box: Box
+    block_id: int
+    block_role: str
+    leaf_role: str
+    mcids: tuple[int, ...]
+    xrefs: tuple[int | None, ...]
 
 
 def resolve_pdf_path() -> Path:
     desktop_docs = Path.home() / "Desktop" / "all_docs"
-    for candidate in sorted(desktop_docs.glob("*.pdf")):
-        if "미래에셋" in candidate.name and "3분기" in candidate.name:
+    exact_name = "\ubbf8\ub798\uc5d0\uc14b\uc99d\uad8c 3\ubd84\uae30 \uc2e4\uc801\ubcf4\uace0\uc11c.pdf"
+    exact_path = desktop_docs / exact_name
+    if exact_path.exists():
+        return exact_path
+    candidates = sorted(desktop_docs.glob("*.pdf"))
+    for candidate in candidates:
+        name = candidate.name
+        if "3" in name and candidate.stat().st_size > 2_000_000:
             return candidate
-    raise FileNotFoundError("Mirae Asset Q3 PDF not found on Desktop/all_docs")
+    raise FileNotFoundError("Could not locate the Q3 Mirae Asset PDF under Desktop/all_docs")
 
 
-def build_tokens(page_elements: list[DocumentElement], *, top_limit: float = 310.0) -> list[Token]:
+def extract_tokens(document: fitz.Document, page: fitz.Page, page_number: int) -> list[Token]:
+    extractor = PowerPointStructTreeExtractor()
+    runs = [run for run in extractor.extract_runs(document) if run.page_number == page_number]
+    mcid_boxes = extract_mcid_boxes_from_image_draws(page)
     tokens: list[Token] = []
-    for element in page_elements:
-        text = str(element.text or "").strip()
-        bbox = element.bbox or []
-        if not text or len(bbox) != 4:
+
+    for run in runs:
+        text = normalize_text(run.text)
+        if not text or text.startswith("/Users/"):
             continue
-        if bbox[1] < 0 or bbox[1] > top_limit:
+        boxes = [mcid_boxes[mcid]["bbox"] for mcid in run.mcids if mcid in mcid_boxes]
+        if not boxes:
             continue
-        if text.startswith("/Users/"):
+        box = union_boxes(boxes)
+        if box.y0 < 0 or box.y0 > TOP_LIMIT:
             continue
         tokens.append(
             Token(
                 text=text,
-                bbox=(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
-                element_type=element.element_type,
+                box=box,
+                block_id=run.block_id,
+                block_role=run.block_role,
+                leaf_role=run.leaf_role,
+                mcids=tuple(run.mcids),
+                xrefs=tuple(mcid_boxes[mcid].get("xref") for mcid in run.mcids if mcid in mcid_boxes),
             )
         )
-    return sorted(tokens, key=lambda item: (item.cy, item.cx))
+    return dedupe_tokens(tokens)
+
+
+def extract_mcid_boxes_from_image_draws(page: fitz.Page) -> dict[int, dict[str, Any]]:
+    resource_map = build_image_resource_map(page)
+    draw_ops = extract_image_draw_operations(page, set(resource_map))
+    try:
+        image_infos = sorted(page.get_image_info(xrefs=True), key=lambda item: item.get("number", 0))
+    except Exception:
+        image_infos = []
+
+    result: dict[int, dict[str, Any]] = {}
+    for draw_op, image_info in zip(draw_ops, image_infos):
+        mcid = draw_op.get("mcid")
+        bbox = image_info.get("bbox") or ()
+        if not isinstance(mcid, int) or len(bbox) != 4:
+            continue
+        box = Box(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        if box.y0 < 0 or box.y0 > TOP_LIMIT:
+            continue
+        item = result.setdefault(
+            mcid,
+            {
+                "bbox": box,
+                "xref": as_int(image_info.get("xref"))
+                or as_int(resource_map.get(str(draw_op.get("xobject_name")), {}).get("xref")),
+                "xobject_name": draw_op.get("xobject_name"),
+            },
+        )
+        item["bbox"] = item["bbox"].union(box)
+    return result
+
+
+def build_image_resource_map(page: fitz.Page) -> dict[str, dict[str, Any]]:
+    resources: dict[str, dict[str, Any]] = {}
+    for item in page.get_images(full=True):
+        if len(item) < 8:
+            continue
+        name = str(item[7] or "")
+        if not name:
+            continue
+        resources[name] = {"name": name, "xref": as_int(item[0])}
+    return resources
+
+
+def extract_image_draw_operations(page: fitz.Page, image_names: set[str]) -> list[dict[str, Any]]:
+    if not image_names:
+        return []
+    try:
+        contents = page.read_contents().decode("latin-1", errors="replace")
+    except Exception:
+        return []
+
+    token_pattern = re.compile(r"/MCID\s+(\d+)|\b(BDC|BMC|EMC)\b|/([A-Za-z0-9_.+-]+)\s+Do")
+    stack: list[int | None] = []
+    pending_mcid: int | None = None
+    operations: list[dict[str, Any]] = []
+
+    for match in token_pattern.finditer(contents):
+        mcid_value, marker, xobject_name = match.group(1), match.group(2), match.group(3)
+        if mcid_value is not None:
+            pending_mcid = int(mcid_value)
+            continue
+        if marker in {"BDC", "BMC"}:
+            stack.append(pending_mcid)
+            pending_mcid = None
+            continue
+        if marker == "EMC":
+            if stack:
+                stack.pop()
+            pending_mcid = None
+            continue
+        if xobject_name and xobject_name in image_names:
+            current_mcid = next((value for value in reversed(stack) if value is not None), None)
+            operations.append({"xobject_name": xobject_name, "mcid": current_mcid})
+    return operations
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").replace("\ufeff", "")).strip()
+
+
+def union_boxes(boxes: list[Box]) -> Box:
+    box = boxes[0]
+    for item in boxes[1:]:
+        box = box.union(item)
+    return box
+
+
+def as_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def dedupe_tokens(tokens: list[Token]) -> list[Token]:
     kept: list[Token] = []
-    for token in tokens:
+    for token in sorted(tokens, key=lambda item: (item.box.y0, item.box.x0, item.text)):
         duplicate = False
         for existing in kept:
             if (
                 token.text == existing.text
-                and abs(token.cx - existing.cx) <= 4
-                and abs(token.cy - existing.cy) <= 4
+                and abs(token.box.cx - existing.box.cx) <= 2.0
+                and abs(token.box.cy - existing.box.cy) <= 2.0
+                and token.mcids == existing.mcids
             ):
                 duplicate = True
                 break
@@ -101,389 +237,551 @@ def dedupe_tokens(tokens: list[Token]) -> list[Token]:
     return kept
 
 
-def cluster_rows(tokens: list[Token], tolerance: float = 10.0) -> list[list[Token]]:
+def extract_drawing_boxes(page: fitz.Page) -> list[dict[str, Any]]:
+    boxes: list[dict[str, Any]] = []
+    for index, drawing in enumerate(page.get_drawings()):
+        rect = drawing.get("rect")
+        if rect is None:
+            continue
+        box = Box(float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1))
+        if box.y1 < 80 or box.y0 > TOP_LIMIT:
+            continue
+        if box.width < 35 or box.height < 18:
+            continue
+        if box.area < 1_200:
+            continue
+        if box.width > page.rect.width * 0.96 or box.height > page.rect.height * 0.60:
+            continue
+        boxes.append(
+            {
+                "index": index,
+                "bbox": box,
+                "fill": color_to_list(drawing.get("fill")),
+                "stroke": color_to_list(drawing.get("color")),
+                "width": drawing.get("width"),
+                "item_count": len(drawing.get("items") or []),
+            }
+        )
+    boxes.extend(extract_large_image_boxes(page))
+    boxes.extend(build_drawing_hull_boxes(boxes, page))
+    return merge_similar_drawing_boxes(boxes)
+
+
+def extract_large_image_boxes(page: fitz.Page) -> list[dict[str, Any]]:
+    boxes: list[dict[str, Any]] = []
+    try:
+        image_infos = page.get_image_info(xrefs=True)
+    except Exception:
+        return boxes
+    for index, info in enumerate(image_infos):
+        bbox = info.get("bbox") or ()
+        if len(bbox) != 4:
+            continue
+        box = Box(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        if box.y1 < 80 or box.y0 > TOP_LIMIT:
+            continue
+        if box.width < 120 or box.height < 35:
+            continue
+        if box.width > page.rect.width * 0.90 or box.height > page.rect.height * 0.50:
+            continue
+        boxes.append(
+            {
+                "index": index,
+                "bbox": box,
+                "fill": None,
+                "stroke": None,
+                "width": None,
+                "item_count": 1,
+                "source_kind": "large-image",
+                "xref": as_int(info.get("xref")),
+            }
+        )
+    return boxes
+
+
+def build_drawing_hull_boxes(drawings: list[dict[str, Any]], page: fitz.Page) -> list[dict[str, Any]]:
+    small_visuals = [
+        drawing["bbox"]
+        for drawing in drawings
+        if drawing.get("source_kind") != "large-image"
+        and drawing["bbox"].width <= 90
+        and drawing["bbox"].height <= 70
+    ]
+    if len(small_visuals) < 2:
+        return []
+
+    hull = union_boxes(small_visuals)
+    if hull.width < 180 or hull.height < 30:
+        return []
+    panel_box = Box(
+        max(0.0, hull.x0 - 8.0),
+        max(80.0, hull.y0 - 92.0),
+        min(float(page.rect.width), hull.x1 + 8.0),
+        min(TOP_LIMIT, hull.y1 + 18.0),
+    )
+    return [
+        {
+            "index": -1,
+            "bbox": panel_box,
+            "fill": None,
+            "stroke": None,
+            "width": None,
+            "item_count": len(small_visuals),
+            "source_kind": "drawing-hull",
+        }
+    ]
+
+
+def color_to_list(value: Any) -> list[float] | None:
+    if value is None:
+        return None
+    try:
+        return [round(float(item), 4) for item in value]
+    except TypeError:
+        return None
+
+
+def merge_similar_drawing_boxes(drawings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted(drawings, key=lambda item: (item["bbox"].area, item["bbox"].y0, item["bbox"].x0), reverse=True)
+    kept: list[dict[str, Any]] = []
+    for drawing in ordered:
+        box = drawing["bbox"]
+        if any(box_overlap_ratio(box, existing["bbox"]) > 0.92 for existing in kept):
+            continue
+        kept.append(drawing)
+    return sorted(kept, key=lambda item: (item["bbox"].x0, item["bbox"].y0))
+
+
+def box_overlap_ratio(a: Box, b: Box) -> float:
+    x0 = max(a.x0, b.x0)
+    y0 = max(a.y0, b.y0)
+    x1 = min(a.x1, b.x1)
+    y1 = min(a.y1, b.y1)
+    overlap = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    smaller = max(1.0, min(a.area, b.area))
+    return overlap / smaller
+
+
+def build_panels(tokens: list[Token], drawings: list[dict[str, Any]], page: fitz.Page) -> list[dict[str, Any]]:
+    drawing_panels: list[dict[str, Any]] = []
+    for drawing in drawings:
+        box = drawing["bbox"]
+        members = [token for token in tokens if box.contains_center(token.box, pad=3.0)]
+        if len(members) < 3:
+            continue
+        drawing_panels.append(
+            {
+                "source": "drawing",
+                "bbox": box,
+                "tokens": members,
+                "drawing": {
+                    "index": drawing["index"],
+                    "source_kind": drawing.get("source_kind", "drawing"),
+                    "fill": drawing["fill"],
+                    "stroke": drawing["stroke"],
+                    "width": drawing["width"],
+                    "item_count": drawing["item_count"],
+                    "xref": drawing.get("xref"),
+                },
+            }
+        )
+
+    panels = remove_nested_panels(drawing_panels)
+    assigned = {id(token) for panel in panels for token in panel["tokens"]}
+    leftovers = [token for token in tokens if id(token) not in assigned and token.box.y0 >= 90.0]
+    panels.extend(build_connected_component_panels(leftovers, page))
+    panels = remove_duplicate_panels(panels)
+    panels = merge_nearby_panels(panels)
+
+    for panel in panels:
+        panel["tokens"] = sorted(panel["tokens"], key=lambda item: (item.box.y0, item.box.x0))
+        panel["rows"] = render_rows(panel["tokens"])
+        panel["text"] = "\n".join(panel["rows"]).strip()
+        panel["token_count"] = len(panel["tokens"])
+
+    return sort_panels(panels)
+
+
+def remove_nested_panels(panels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for panel in sorted(panels, key=lambda item: item["bbox"].area, reverse=True):
+        box = panel["bbox"]
+        if any(box_overlap_ratio(box, existing["bbox"]) > 0.88 for existing in kept):
+            continue
+        kept.append(panel)
+    return kept
+
+
+def build_connected_component_panels(tokens: list[Token], page: fitz.Page) -> list[dict[str, Any]]:
+    components: list[list[Token]] = []
+    for token in sorted(tokens, key=lambda item: (item.box.x0, item.box.y0)):
+        target_index: int | None = None
+        expanded = token.box.padded(24.0)
+        for index, component in enumerate(components):
+            component_box = union_token_box(component).padded(28.0)
+            if expanded.intersects(component_box):
+                target_index = index
+                break
+        if target_index is None:
+            components.append([token])
+        else:
+            components[target_index].append(token)
+
+    changed = True
+    while changed:
+        changed = False
+        merged: list[list[Token]] = []
+        for component in components:
+            component_box = union_token_box(component).padded(30.0)
+            for existing in merged:
+                if component_box.intersects(union_token_box(existing).padded(30.0)):
+                    existing.extend(component)
+                    changed = True
+                    break
+            else:
+                merged.append(component)
+        components = merged
+
+    panels: list[dict[str, Any]] = []
+    for component in components:
+        if len(component) < 3:
+            continue
+        box = union_token_box(component).padded(8.0)
+        if box.area < 1_500 or box.width > page.rect.width * 0.95:
+            continue
+        panels.append({"source": "coordinate-fallback", "bbox": box, "tokens": component})
+    return panels
+
+
+def merge_nearby_panels(panels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    changed = True
+    while changed:
+        changed = False
+        next_panels: list[dict[str, Any]] = []
+        used: set[int] = set()
+        for index, panel in enumerate(panels):
+            if index in used:
+                continue
+            merged = panel
+            for other_index in range(index + 1, len(panels)):
+                if other_index in used:
+                    continue
+                other = panels[other_index]
+                if should_merge_panels(merged, other):
+                    merged = combine_panels(merged, other)
+                    used.add(other_index)
+                    changed = True
+            used.add(index)
+            next_panels.append(merged)
+        panels = next_panels
+    return panels
+
+
+def should_merge_panels(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    a = left["bbox"]
+    b = right["bbox"]
+    left_kind = (left.get("drawing") or {}).get("source_kind")
+    right_kind = (right.get("drawing") or {}).get("source_kind")
+    horizontal_gap = max(0.0, max(a.x0, b.x0) - min(a.x1, b.x1))
+    vertical_gap = max(0.0, max(a.y0, b.y0) - min(a.y1, b.y1))
+    y_overlap = axis_overlap_ratio(a.y0, a.y1, b.y0, b.y1)
+    x_overlap = axis_overlap_ratio(a.x0, a.x1, b.x0, b.x1)
+
+    if "drawing-hull" in {left_kind, right_kind} and x_overlap < 0.20:
+        return False
+    if y_overlap >= 0.35 and horizontal_gap <= 70.0:
+        return True
+    large_box: Box | None = None
+    other_box: Box | None = None
+    if left_kind == "large-image":
+        large_box, other_box = a, b
+    elif right_kind == "large-image":
+        large_box, other_box = b, a
+    if (
+        large_box is not None
+        and other_box is not None
+        and other_box.y0 >= large_box.y1
+        and x_overlap >= 0.25
+        and 0.0 < vertical_gap <= 38.0
+    ):
+        return True
+    return False
+
+
+def axis_overlap_ratio(a0: float, a1: float, b0: float, b1: float) -> float:
+    overlap = max(0.0, min(a1, b1) - max(a0, b0))
+    smaller = max(1.0, min(a1 - a0, b1 - b0))
+    return overlap / smaller
+
+
+def combine_panels(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    source = left["source"] if left["source"] == "drawing" else right["source"]
+    drawing = left.get("drawing") or right.get("drawing")
+    return {
+        "source": source,
+        "bbox": left["bbox"].union(right["bbox"]),
+        "tokens": list(dict.fromkeys([*left["tokens"], *right["tokens"]])),
+        "drawing": drawing,
+    }
+
+
+def remove_duplicate_panels(panels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted(panels, key=lambda item: (0 if item["source"] == "drawing" else 1, -item["token_count"] if "token_count" in item else 0))
+    kept: list[dict[str, Any]] = []
+    for panel in ordered:
+        box = panel["bbox"]
+        token_ids = {id(token) for token in panel["tokens"]}
+        duplicate = False
+        for existing in kept:
+            existing_ids = {id(token) for token in existing["tokens"]}
+            if box_overlap_ratio(box, existing["bbox"]) > 0.70 or len(token_ids & existing_ids) >= max(2, len(token_ids) * 0.70):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(panel)
+    return kept
+
+
+def union_token_box(tokens: list[Token]) -> Box:
+    return Box(
+        min(token.box.x0 for token in tokens),
+        min(token.box.y0 for token in tokens),
+        max(token.box.x1 for token in tokens),
+        max(token.box.y1 for token in tokens),
+    )
+
+
+def sort_panels(panels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not panels:
+        return []
+    columns: list[list[dict[str, Any]]] = []
+    for panel in sorted(panels, key=lambda item: item["bbox"].x0):
+        for column in columns:
+            column_box = union_panel_box(column)
+            if abs(panel["bbox"].x0 - column_box.x0) <= 80.0 or abs(panel["bbox"].cx - column_box.cx) <= max(80.0, min(panel["bbox"].width, column_box.width) * 0.45):
+                column.append(panel)
+                break
+        else:
+            columns.append([panel])
+
+    ordered: list[dict[str, Any]] = []
+    for column in sorted(columns, key=lambda col: union_panel_box(col).x0):
+        ordered.extend(sorted(column, key=lambda item: item["bbox"].y0))
+
+    for index, panel in enumerate(ordered, start=1):
+        panel["panel_id"] = f"P{index}"
+    return ordered
+
+
+def union_panel_box(panels: list[dict[str, Any]]) -> Box:
+    box = panels[0]["bbox"]
+    for panel in panels[1:]:
+        box = box.union(panel["bbox"])
+    return box
+
+
+def render_rows(tokens: list[Token]) -> list[str]:
     rows: list[list[Token]] = []
-    for token in sorted(tokens, key=lambda item: (item.cy, item.cx)):
+    for token in sorted(tokens, key=lambda item: (item.box.cy, item.box.x0)):
         if not rows:
             rows.append([token])
             continue
         row = rows[-1]
-        row_center = sum(item.cy for item in row) / len(row)
-        if abs(token.cy - row_center) <= tolerance:
+        row_center = sum(item.box.cy for item in row) / len(row)
+        tolerance = max(4.0, min(11.0, token.box.height * 0.75))
+        if abs(token.box.cy - row_center) <= tolerance:
             row.append(token)
         else:
             rows.append([token])
+    rendered: list[str] = []
     for row in rows:
-        row.sort(key=lambda item: item.x0)
-    return rows
+        ordered = sorted(row, key=lambda item: item.box.x0)
+        parts: list[str] = []
+        previous: Token | None = None
+        for token in ordered:
+            if previous is not None and token.box.x0 - previous.box.x1 > 18.0:
+                parts.append(" | ")
+            elif previous is not None:
+                parts.append(" ")
+            parts.append(token.text)
+            previous = token
+        rendered.append("".join(parts).strip())
+    return rendered
 
 
-def union_bbox(tokens: list[Token]) -> list[float]:
-    return [
-        min(token.x0 for token in tokens),
-        min(token.y0 for token in tokens),
-        max(token.x1 for token in tokens),
-        max(token.y1 for token in tokens),
+def build_payload(pdf_path: Path) -> dict[str, Any]:
+    with fitz.open(pdf_path) as document:
+        page = document[PAGE_NUMBER - 1]
+        tokens = extract_tokens(document, page, PAGE_NUMBER)
+        drawings = extract_drawing_boxes(page)
+        panels = build_panels(tokens, drawings, page)
+        return {
+            "pdf_path": pdf_path.as_posix(),
+            "page_number": PAGE_NUMBER,
+            "page_size": [round(float(page.rect.width), 3), round(float(page.rect.height), 3)],
+            "method": "MCID/xref text runs plus drawing object panel candidates and coordinate fallback; no text-rule classification",
+            "top_limit": TOP_LIMIT,
+            "token_count": len(tokens),
+            "drawing_candidate_count": len(drawings),
+            "panel_count": len(panels),
+            "panels": [
+                {
+                    "panel_id": panel["panel_id"],
+                    "source": panel["source"],
+                    "bbox": panel["bbox"].to_list(),
+                    "token_count": panel["token_count"],
+                    "drawing": panel.get("drawing"),
+                    "rows": panel["rows"],
+                    "text": panel["text"],
+                    "tokens": [
+                        {
+                            "text": token.text,
+                            "bbox": token.box.to_list(),
+                            "mcids": list(token.mcids),
+                            "xrefs": [xref for xref in token.xrefs if xref is not None],
+                            "role": f"{token.block_role}/{token.leaf_role}",
+                        }
+                        for token in panel["tokens"]
+                    ],
+                    "mcids": sorted({mcid for token in panel["tokens"] for mcid in token.mcids}),
+                    "xrefs": sorted({xref for token in panel["tokens"] for xref in token.xrefs if xref is not None}),
+                }
+                for panel in panels
+            ],
+            "drawing_candidates": [
+                {
+                    "index": drawing["index"],
+                    "bbox": drawing["bbox"].to_list(),
+                    "fill": drawing["fill"],
+                    "stroke": drawing["stroke"],
+                    "width": drawing["width"],
+                    "item_count": drawing["item_count"],
+                    "source_kind": drawing.get("source_kind", "drawing"),
+                    "xref": drawing.get("xref"),
+                }
+                for drawing in drawings
+            ],
+        }
+
+
+def write_markdown(payload: dict[str, Any]) -> str:
+    lines = [
+        "# Page 16 Panel Segmentation Probe",
+        "",
+        f"- Method: {payload['method']}",
+        f"- Tokens in top region: {payload['token_count']}",
+        f"- Drawing candidates: {payload['drawing_candidate_count']}",
+        f"- Panels: {payload['panel_count']}",
+        "",
     ]
-
-
-def build_visual_blocks(tokens: list[Token], chart_right_edge: float) -> list[dict[str, object]]:
-    candidate_tokens = [token for token in tokens if token.cy >= 120]
-    chart_block = [token for token in candidate_tokens if token.x0 < chart_right_edge + 18]
-    right_block = [token for token in candidate_tokens if token.x0 >= chart_right_edge + 18]
-    right_top = [token for token in right_block if token.cy < 220]
-    right_bottom = [token for token in right_block if token.cy >= 220]
-
-    blocks = [block for block in [chart_block, right_top, right_bottom] if block]
-
-    payload: list[dict[str, object]] = []
-    for index, block in enumerate(blocks, start=1):
-        bbox = union_bbox(block)
-        payload.append(
-            {
-                "block_id": index,
-                "bbox": bbox,
-                "token_count": len(block),
-                "tokens": [
-                    {"text": token.text, "bbox": list(token.bbox), "type": token.element_type}
-                    for token in sorted(block, key=lambda item: (item.cy, item.cx))
-                ],
-            }
+    for panel in payload["panels"]:
+        lines.extend(
+            [
+                f"## {panel['panel_id']} ({panel['source']})",
+                "",
+                f"- BBox: `{panel['bbox']}`",
+                f"- Token count: `{panel['token_count']}`",
+                f"- MCIDs: `{panel['mcids'][:24]}{' ...' if len(panel['mcids']) > 24 else ''}`",
+                f"- XRefs: `{panel['xrefs'][:12]}{' ...' if len(panel['xrefs']) > 12 else ''}`",
+                "",
+                "```text",
+                panel["text"],
+                "```",
+                "",
+            ]
         )
-    return payload
+    return "\n".join(lines)
 
 
-def detect_chart_year_anchors(tokens: list[Token]) -> list[Token]:
-    candidates = [token for token in tokens if YEAR_RE.match(token.text)]
-    if not candidates:
-        return []
-    rows = cluster_rows(candidates, tolerance=12.0)
-    rows = [row for row in rows if len(row) >= 3]
-    if not rows:
-        return []
-    chosen = max(rows, key=lambda row: (len(row), sum(item.cy for item in row) / len(row)))
-    return sorted(chosen, key=lambda item: item.cx)
-
-
-def detect_legend_labels(tokens: list[Token], chart_right_edge: float) -> list[str]:
-    candidates = [
-        token
-        for token in tokens
-        if token.x0 < chart_right_edge
-        and token.cy < 170
-        and KOREAN_RE.search(token.text)
-        and not YEAR_RE.match(token.text)
-        and not PERCENT_RE.match(token.text)
-    ]
-    rows = cluster_rows(candidates, tolerance=10.0)
-    if not rows:
-        return []
-    best_row = max(rows, key=len)
-    labels: list[str] = []
-    for token in best_row:
-        value = token.text.replace("■", "").strip()
-        if not value or len(value) == 1:
-            continue
-        if value in labels:
-            continue
-        labels.append(value)
-    return labels
-
-
-def build_chart_series(tokens: list[Token], anchors: list[Token]) -> list[dict[str, object]]:
-    if not anchors:
-        return []
-    chart_left = min(anchor.x0 for anchor in anchors) - 40
-    chart_right = max(anchor.x1 for anchor in anchors) + 40
-    chart_tokens = [
-        token
-        for token in tokens
-        if chart_left <= token.cx <= chart_right
-        and 160 <= token.cy <= 285
-        and (NUMBER_RE.match(token.text) or PERCENT_RE.match(token.text))
-    ]
-
-    bands: dict[int, list[Token]] = {}
-    for token in chart_tokens:
-        anchor_index = min(range(len(anchors)), key=lambda idx: abs(token.cx - anchors[idx].cx))
-        if abs(token.cx - anchors[anchor_index].cx) <= 28:
-            bands.setdefault(anchor_index, []).append(token)
-
-    years = [anchor.text for anchor in anchors]
-    series_names = ["rate_percent", "total_amount", "dividend_amount", "retirement_amount"]
-    series_values: dict[str, list[str | None]] = {name: [] for name in series_names}
-
-    for index in range(len(anchors)):
-        column = sorted(bands.get(index, []), key=lambda item: (item.cy, abs(item.cx - anchors[index].cx)))
-        percents = [item for item in column if PERCENT_RE.match(item.text)]
-        percent = None
-        if percents:
-            percent = min(percents, key=lambda item: abs(item.cx - anchors[index].cx)).text
-
-        number_tokens = [item for item in column if NUMBER_RE.match(item.text)]
-        number_tokens.sort(key=lambda item: item.cy)
-        total = number_tokens[0].text if len(number_tokens) >= 1 else None
-        amount_top = number_tokens[1].text if len(number_tokens) >= 2 else None
-        amount_bottom = number_tokens[2].text if len(number_tokens) >= 3 else None
-
-        series_values["rate_percent"].append(percent)
-        series_values["total_amount"].append(total)
-        series_values["dividend_amount"].append(amount_top)
-        series_values["retirement_amount"].append(amount_bottom)
-
-    return [
-        {"name": name, "years": years, "values": values}
-        for name, values in series_values.items()
-    ]
-
-
-def _numeric_value(text: str) -> float:
-    try:
-        return float(text.replace(",", "").replace("%", ""))
-    except ValueError:
-        return -1.0
-
-
-def detect_right_side_kpis(tokens: list[Token], chart_right_edge: float) -> dict[str, object]:
-    right_tokens = [token for token in tokens if token.x0 >= chart_right_edge + 20]
-    rows = cluster_rows(right_tokens, tolerance=14.0)
-    title_parts: list[str] = []
-    subtitle_parts: list[str] = []
-    large_numbers: list[Token] = []
-    label_value_pairs: list[dict[str, str]] = []
-
-    for row in rows:
-        row_text = "".join(token.text for token in row if token.text != "■").strip()
-        if not row_text:
-            continue
-        row_korean = [token.text for token in row if KOREAN_RE.search(token.text) and len(token.text.strip()) >= 2]
-        if not title_parts and 130 <= row[0].cy <= 165 and row_korean:
-            title_parts.append("".join(row_korean))
-            continue
-        if "이후" in row_text:
-            subtitle_parts.append("".join(row_korean) or row_text)
-            continue
-        row_numbers = [token for token in row if NUMBER_RE.match(token.text)]
-        if row_numbers and max(token.height for token in row_numbers) >= 15 and row[0].cy < 230:
-            large_numbers.extend(row_numbers)
-        labels = [token.text for token in row if KOREAN_RE.search(token.text) and not NUMBER_RE.match(token.text) and len(token.text.strip()) >= 2]
-        values = [token.text for token in row if NUMBER_RE.match(token.text)]
-        if labels and values:
-            label_value_pairs.append({"label": "".join(labels), "value": "".join(values)})
-
-    large_numbers = sorted(large_numbers, key=lambda item: (-item.height, item.cy, item.cx))
-    total_amount = None
-    if large_numbers:
-        total_amount = large_numbers[0].text
-
-    equation_row_tokens = [
-        token
-        for token in right_tokens
-        if 220 <= token.cy <= 275
-    ]
-    equation_rows = cluster_rows(equation_row_tokens, tolerance=20.0)
-    equation_row = max(equation_rows, key=lambda row: sum(1 for item in row if KOREAN_RE.search(item.text) or NUMBER_RE.match(item.text))) if equation_rows else []
-    equation = _compress_equation_row(equation_row)
-
-    return {
-        "title_candidates": title_parts,
-        "subtitle_candidates": subtitle_parts,
-        "large_total_candidate": total_amount,
-        "label_value_pairs": label_value_pairs,
-        "equation_tokens": equation,
-    }
-
-
-def _compress_equation_row(row: list[Token]) -> list[str]:
-    if not row:
-        return []
-    ordered = sorted(row, key=lambda item: item.x0)
-    groups: list[list[Token]] = [[ordered[0]]]
-    for token in ordered[1:]:
-        if token.x0 - groups[-1][-1].x1 <= 18:
-            groups[-1].append(token)
-        else:
-            groups.append([token])
-
-    values: list[str] = []
-    for group in groups:
-        text = "".join(item.text for item in group).strip()
-        text = text.replace(" ", "")
-        if not text:
-            continue
-        values.append(text)
-    return values
+def write_html(payload: dict[str, Any]) -> str:
+    page_width, _page_height = payload["page_size"]
+    scale = 1.25
+    canvas_width = int(page_width * scale)
+    canvas_height = int(TOP_LIMIT * scale)
+    overlays: list[str] = []
+    colors = ["#d9485f", "#0f766e", "#2563eb", "#9333ea", "#b45309", "#047857"]
+    for index, panel in enumerate(payload["panels"]):
+        x0, y0, x1, y1 = panel["bbox"]
+        color = colors[index % len(colors)]
+        overlays.append(
+            "<div class='panel' "
+            f"style='left:{x0 * scale}px;top:{y0 * scale}px;width:{(x1 - x0) * scale}px;height:{(y1 - y0) * scale}px;border-color:{color};'>"
+            f"<span style='background:{color};'>{escape(panel['panel_id'])}</span></div>"
+        )
+    token_marks: list[str] = []
+    for panel in payload["panels"]:
+        for token in panel["tokens"]:
+            x0, y0, x1, y1 = token["bbox"]
+            token_marks.append(
+                "<div class='token' "
+                f"style='left:{x0 * scale}px;top:{y0 * scale}px;width:{max(2, (x1 - x0) * scale)}px;height:{max(2, (y1 - y0) * scale)}px;'>"
+                f"{escape(token['text'])}</div>"
+            )
+    panel_cards = "".join(
+        "<section class='card'>"
+        f"<h2>{escape(panel['panel_id'])} <span>{escape(panel['source'])}</span></h2>"
+        f"<p>bbox={escape(str(panel['bbox']))} / tokens={panel['token_count']}</p>"
+        f"<pre>{escape(panel['text'])}</pre>"
+        "</section>"
+        for panel in payload["panels"]
+    )
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>Page 16 Panel Probe</title>
+  <style>
+    body {{ margin:0; padding:24px; font-family:Segoe UI, Malgun Gothic, sans-serif; background:#f6f7f9; color:#172033; }}
+    h1 {{ margin:0 0 6px; font-size:24px; }}
+    .meta {{ margin:0 0 18px; color:#5b667a; }}
+    .layout {{ display:grid; grid-template-columns:{canvas_width}px minmax(360px, 1fr); gap:18px; align-items:start; }}
+    .canvas {{ position:relative; width:{canvas_width}px; height:{canvas_height}px; background:#fff; border:1px solid #cfd6e3; overflow:hidden; }}
+    .panel {{ position:absolute; border:2px solid; box-sizing:border-box; background:rgba(255,255,255,0.05); }}
+    .panel span {{ position:absolute; left:-2px; top:-22px; color:#fff; font-size:12px; padding:2px 7px; }}
+    .token {{ position:absolute; font-size:9px; color:#111827; outline:1px solid rgba(37,99,235,0.16); overflow:hidden; white-space:nowrap; }}
+    .cards {{ display:grid; gap:12px; }}
+    .card {{ background:#fff; border:1px solid #d9dfeb; padding:14px; }}
+    .card h2 {{ margin:0 0 6px; font-size:16px; }}
+    .card h2 span {{ color:#64748b; font-size:12px; font-weight:500; }}
+    .card p {{ margin:0 0 10px; color:#64748b; font-size:12px; }}
+    pre {{ margin:0; white-space:pre-wrap; line-height:1.5; font-size:13px; }}
+  </style>
+</head>
+<body>
+  <h1>Page 16 Panel Segmentation Probe</h1>
+  <p class="meta">MCID/xref text runs + drawing candidates + coordinate fallback, no text-rule classification</p>
+  <div class="layout">
+    <div class="canvas">{''.join(token_marks)}{''.join(overlays)}</div>
+    <div class="cards">{panel_cards}</div>
+  </div>
+</body>
+</html>
+"""
 
 
 def main() -> None:
     pdf_path = resolve_pdf_path()
     output_dir = DEFAULT_OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    parsed = PdfParser(enable_omitted_picture_ocr=False).parse(pdf_path, classify_document(pdf_path))
-    page = parsed.pages[15]
-
-    tokens = dedupe_tokens(build_tokens(page.elements))
-    anchors = detect_chart_year_anchors(tokens)
-    chart_right_edge = max((anchor.x1 for anchor in anchors), default=380.0)
-    legend_labels = detect_legend_labels(tokens, chart_right_edge)
-    chart_series = build_chart_series(tokens, anchors)
-    kpis = detect_right_side_kpis(tokens, chart_right_edge)
-    visual_blocks = build_visual_blocks(tokens, chart_right_edge)
-
-    payload = {
-        "pdf_path": pdf_path.as_posix(),
-        "page_number": 16,
-        "top_region_token_count": len(tokens),
-        "chart": {
-            "year_anchors": [
-                {"text": anchor.text, "bbox": list(anchor.bbox)}
-                for anchor in anchors
-            ],
-            "legend_labels": legend_labels,
-            "series": chart_series,
-        },
-        "right_panel": kpis,
-        "visual_blocks": visual_blocks,
-        "sample_tokens": [
-            {"text": token.text, "bbox": list(token.bbox), "type": token.element_type}
-            for token in tokens[:120]
-        ],
-    }
-
-    output_path = output_dir / "miraeasset_page16_top_probe.json"
-    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    html_path = output_dir / "miraeasset_page16_top_probe.html"
-    html_path.write_text(build_html_report(payload), encoding="utf-8")
-    print(json.dumps({"output_path": output_path.as_posix(), "html_path": html_path.as_posix()}, ensure_ascii=False))
-
-
-def build_html_report(payload: dict[str, object]) -> str:
-    blocks = payload.get("visual_blocks") or []
-    cards: list[str] = []
-    overlays: list[str] = []
-    colors = ["#ff7a18", "#0f4c81", "#3f8f5f", "#a855f7", "#d9485f", "#1f9d8b", "#b7791f"]
-
-    for index, block in enumerate(blocks):
-        bbox = block["bbox"]
-        color = colors[index % len(colors)]
-        left = bbox[0]
-        top = bbox[1]
-        width = max(1.0, bbox[2] - bbox[0])
-        height = max(1.0, bbox[3] - bbox[1])
-        overlays.append(
-            f"<div class='overlay' style='left:{left}px;top:{top}px;width:{width}px;height:{height}px;border-color:{color};'>"
-            f"<span style='background:{color};'>B{block['block_id']}</span></div>"
+    payload = build_payload(pdf_path)
+    json_path = output_dir / "miraeasset_page16_panel_probe.json"
+    md_path = output_dir / "miraeasset_page16_panel_probe.md"
+    html_path = output_dir / "miraeasset_page16_panel_probe.html"
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    md_path.write_text(write_markdown(payload), encoding="utf-8")
+    html_path.write_text(write_html(payload), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "json_path": json_path.as_posix(),
+                "md_path": md_path.as_posix(),
+                "html_path": html_path.as_posix(),
+                "panel_count": payload["panel_count"],
+                "drawing_candidate_count": payload["drawing_candidate_count"],
+            },
+            ensure_ascii=False,
         )
-        token_lines = "".join(
-            f"<li><code>{escape(token['text'])}</code> <span>{token['bbox']}</span></li>"
-            for token in block["tokens"][:20]
-        )
-        cards.append(
-            "<section class='card'>"
-            f"<h3>Block {block['block_id']}</h3>"
-            f"<p>bbox={block['bbox']} token_count={block['token_count']}</p>"
-            f"<ul>{token_lines}</ul>"
-            "</section>"
-        )
-
-    summary = payload.get("chart") or {}
-    right_panel = payload.get("right_panel") or {}
-    return f"""<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mirae Asset Page 16 Top Probe</title>
-  <style>
-    body {{
-      margin: 0;
-      padding: 24px;
-      background: #f4f1ea;
-      color: #1f2933;
-      font-family: "Segoe UI", "Malgun Gothic", sans-serif;
-    }}
-    h1, h2, h3, p {{ margin: 0; }}
-    .layout {{
-      display: grid;
-      grid-template-columns: 820px 1fr;
-      gap: 20px;
-      align-items: start;
-    }}
-    .canvas {{
-      position: relative;
-      width: 800px;
-      height: 360px;
-      background: linear-gradient(180deg, #fffaf2, #fff);
-      border: 1px solid #e2d7c6;
-      box-shadow: 0 16px 40px rgba(31, 41, 51, 0.08);
-      overflow: hidden;
-    }}
-    .overlay {{
-      position: absolute;
-      border: 2px solid;
-      background: rgba(255,255,255,0.08);
-      box-sizing: border-box;
-    }}
-    .overlay span {{
-      position: absolute;
-      left: -2px;
-      top: -22px;
-      color: white;
-      font-size: 12px;
-      padding: 2px 6px;
-      border-radius: 999px;
-    }}
-    .sidebar {{
-      display: grid;
-      gap: 12px;
-    }}
-    .summary, .card {{
-      background: white;
-      border: 1px solid #eadfce;
-      padding: 14px 16px;
-      box-shadow: 0 10px 24px rgba(31, 41, 51, 0.06);
-    }}
-    .summary pre {{
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-size: 12px;
-      line-height: 1.45;
-      margin: 8px 0 0;
-    }}
-    .card ul {{
-      margin: 10px 0 0;
-      padding-left: 18px;
-      font-size: 12px;
-      line-height: 1.45;
-    }}
-    .card li span {{
-      color: #6b7280;
-    }}
-  </style>
-</head>
-<body>
-  <h1>미래에셋 3분기 16페이지 상단 구조화 프로브</h1>
-  <p>상단 인포그래픽 토큰을 일반화된 블록 군집으로 나눈 결과입니다.</p>
-  <div class="layout">
-    <div class="canvas">
-      {''.join(overlays)}
-    </div>
-    <div class="sidebar">
-      <section class="summary">
-        <h2>Chart Summary</h2>
-        <pre>{escape(json.dumps(summary, ensure_ascii=False, indent=2))}</pre>
-      </section>
-      <section class="summary">
-        <h2>Right Panel Summary</h2>
-        <pre>{escape(json.dumps(right_panel, ensure_ascii=False, indent=2))}</pre>
-      </section>
-      {''.join(cards)}
-    </div>
-  </div>
-</body>
-</html>
-"""
+    )
 
 
 if __name__ == "__main__":

@@ -48,8 +48,17 @@ class UploadedDocument:
 
 
 class ReviewSessionManager:
-    def __init__(self, project_root: Path, embedding_backend: EmbeddingBackend | None = None) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        embedding_backend: EmbeddingBackend | None = None,
+        *,
+        markdown_mode: str = "both",
+        qa_mode: str = "hybrid",
+    ) -> None:
         self.project_root = project_root
+        self.markdown_mode = markdown_mode
+        self.qa_mode = qa_mode
         self.project_review_root = project_root / "outputs" / "reports" / "pdf_overlay_review"
         self.project_review_manifest_path = self.project_review_root / "manifest.json"
         self.project_parsing_root = project_root / "outputs" / "reports" / "parsing_review"
@@ -234,6 +243,8 @@ class ReviewSessionManager:
                 comparisons_root=session_root / "comparisons",
                 reports_root=session_root / "reports",
                 enable_omitted_picture_ocr=False,
+                markdown_mode=self.markdown_mode,
+                qa_mode=self.qa_mode,
                 on_document_ready=on_document_ready,
             )
             summary = ParsingPipeline(config).run()

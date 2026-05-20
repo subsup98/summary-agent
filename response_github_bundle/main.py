@@ -679,6 +679,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve the Document Studio UI.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8233)
+    parser.add_argument("--markdown-mode", choices=["original", "llm_ready", "both"], default="both")
+    parser.add_argument("--qa-mode", choices=["original", "llm_ready", "hybrid"], default="hybrid")
     return parser.parse_args()
 
 
@@ -3743,7 +3745,7 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     clear_process_proxy_env()
     args = parse_args()
-    manager = ReviewSessionManager(project_root=ROOT)
+    manager = ReviewSessionManager(project_root=ROOT, markdown_mode=args.markdown_mode, qa_mode=args.qa_mode)
     retriever = ChromaRetriever(project_root=ROOT)
     langchain_service = LazyLangChainService(project_root=ROOT)
 

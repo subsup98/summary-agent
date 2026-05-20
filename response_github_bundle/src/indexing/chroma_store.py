@@ -245,7 +245,14 @@ class ChromaIndexManager:
         }
 
     def _get_semantic_chunks(self, payload: dict[str, Any], markdown: str) -> list[dict[str, Any]]:
-        raw_chunks = payload.get("semantic_chunks")
+        retrieval_config = payload.get("retrieval_config") if isinstance(payload.get("retrieval_config"), dict) else {}
+        qa_mode = str(retrieval_config.get("qa_mode") or "hybrid")
+        if qa_mode == "hybrid" and isinstance(payload.get("hybrid_retrieval_chunks"), list):
+            raw_chunks = payload.get("hybrid_retrieval_chunks")
+        elif qa_mode == "llm_ready" and isinstance(payload.get("llm_ready_chunks"), list):
+            raw_chunks = payload.get("llm_ready_chunks")
+        else:
+            raw_chunks = payload.get("semantic_chunks")
         if isinstance(raw_chunks, list):
             normalized_chunks: list[dict[str, Any]] = []
             for index, chunk in enumerate(raw_chunks):
@@ -256,11 +263,17 @@ class ChromaIndexManager:
                     continue
                 normalized_chunks.append(
                     {
-                        "strategy": "semantic",
+                        "strategy": str(chunk.get("strategy") or ("hybrid" if qa_mode == "hybrid" else "semantic")),
                         "chunk_index": int(chunk.get("chunk_index", index) or index),
                         "text": text,
                         "char_count": int(chunk.get("char_count", len(text)) or len(text)),
                         "section_hint": chunk.get("section_hint"),
+                        "page_number": chunk.get("page_number"),
+                        "chunk_type": chunk.get("chunk_type") or "",
+                        "semantic_type": chunk.get("semantic_type") or "",
+                        "retrieval_lane": chunk.get("retrieval_lane") or "",
+                        "region_id": chunk.get("region_id") or "",
+                        "chunk_id": chunk.get("chunk_id") or "",
                     }
                 )
             if normalized_chunks:
@@ -292,6 +305,11 @@ class ChromaIndexManager:
                 "asset_page_number": (
                     chunk.get("asset_page_number") if chunk.get("asset_page_number") is not None else ""
                 ),
+                "chunk_type": chunk.get("chunk_type") or "",
+                "semantic_type": chunk.get("semantic_type") or "",
+                "retrieval_lane": chunk.get("retrieval_lane") or "",
+                "region_id": chunk.get("region_id") or "",
+                "chunk_id": chunk.get("chunk_id") or "",
                 "content_hash": content_hash,
             }
             for chunk in prepared_chunks
